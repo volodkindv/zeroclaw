@@ -7890,14 +7890,19 @@ async fn dispatch_worker(
             )
         };
 
-        if interrupt_enabled && let Some(previous) = previous {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"sender": msg.sender})),
-                "interrupting previous in-flight request for sender"
-            );
-            previous.cancellation.cancel();
+        if let Some(previous) = previous {
+            if interrupt_enabled {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"sender": msg.sender})),
+                    "interrupting previous in-flight request for sender"
+                );
+                previous.cancellation.cancel();
+            }
+            // Serialize same-scope dispatches: even when interrupt_on_new_message is
+            // disabled, a new message must wait for the in-flight turn to complete
+            // instead of starting a concurrent run (duplicate answers/side effects).
             previous.completion.wait().await;
         }
     }
@@ -22270,8 +22275,16 @@ BTC is currently around $65,000 based on latest tool output."#
         run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 2).await;
 
         let peak = peak_in_flight.load(Ordering::SeqCst);
-        assert_eq!(peak, 1, "same-session messages must be serialized when interrupt_on_new_message is false, got peak concurrency {}", peak);
-        assert_eq!(in_flight.load(Ordering::SeqCst), 0, "all in-flight dispatches should have completed");
+        assert_eq!(
+            peak, 1,
+            "same-session messages must be serialized when interrupt_on_new_message is false, got peak concurrency {}",
+            peak
+        );
+        assert_eq!(
+            in_flight.load(Ordering::SeqCst),
+            0,
+            "all in-flight dispatches should have completed"
+        );
 
         let sent_messages = channel_impl.sent_messages.lock().await;
         assert_eq!(sent_messages.len(), 2);
