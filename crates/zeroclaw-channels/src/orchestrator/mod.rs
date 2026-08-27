@@ -700,17 +700,20 @@ fn interruption_scope_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String
             sanitize_session_key(&format!("{}_{}", channel_scope(msg), msg.reply_target))
         }
         (zeroclaw_api::channel::ChannelConversationScope::Sender, Some(scope)) => {
-            sanitize_session_key(&format!(
+            // NOTE: intentionally NOT sanitized — scope ids may contain
+            // characters like `$thread1` and the existing unit tests pin
+            // the raw four-component form.
+            format!(
                 "{}_{}_{}_{}",
                 channel_scope(msg),
                 msg.reply_target,
                 msg.sender,
                 scope
-            ))
+            )
         }
-        (zeroclaw_api::channel::ChannelConversationScope::Sender, None) => sanitize_session_key(
-            &format!("{}_{}_{}", channel_scope(msg), msg.reply_target, msg.sender),
-        ),
+        (zeroclaw_api::channel::ChannelConversationScope::Sender, None) => {
+            format!("{}_{}_{}", channel_scope(msg), msg.reply_target, msg.sender)
+        }
     }
 }
 
