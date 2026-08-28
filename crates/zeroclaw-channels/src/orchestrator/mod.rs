@@ -7882,6 +7882,12 @@ async fn process_channel_message_body(
 /// Registers `state` in the scope's queue and returns the predecessor whose
 /// completion the caller must wait on, if any. Runs in the receiver task so
 /// admission order matches channel receive order (FIFO).
+///
+/// The predecessor is always the ACTIVE turn, never the tail of the waiting
+/// queue: with interrupt_on_new_message the new worker must cancel the running
+/// turn (a queued successor has nothing to cancel yet), and without it the new
+/// worker waits on the running turn — promotion through the queue is handled by
+/// the active worker alone (see `finish_active`).
 async fn register_in_flight(
     in_flight: &tokio::sync::Mutex<HashMap<String, InFlightScopeState>>,
     scope_key: &str,
@@ -7893,14 +7899,84 @@ async fn register_in_flight(
         scope.active = Some(state);
         None
     } else {
-        let predecessor = scope
-            .waiting
-            .back()
-            .cloned()
-            .or_else(|| scope.active.clone());
+        let predecessor = scope.active.clone();
         scope.waiting.push_back(state);
         predecessor
     }
+}
+
+/// Atomically hands the active slot to the next queued waiter, or removes the
+/// scope entry when the queue is empty. Only the task currently holding the
+/// slot (`active.task_id == task_id`) may transition it; otherwise the record
+/// has already moved on (a newer handoff or `/stop`) and this is a no-op.
+///
+/// Promotion must happen under the map lock and in one place, so a late-arriving
+/// message can never squeeze between "the active turn finished" and "the next
+/// waiter is promoted": either it registers into a queue whose head is already
+/// promoted, or it registers as the new active after the entry was removed. In
+/// particular the removal of an emptied entry happens under the SAME lock that
+/// decided to remove it — if it were a second, later lock, a message arriving
+/// in between would register into a record that is about to be deleted and be
+/// silently dropped with it.
+async fn finish_active(
+    in_flight: &tokio::sync::Mutex<HashMap<String, InFlightScopeState>>,
+    scope_key: &str,
+    task_id: u64,
+) {
+    let mut map = in_flight.lock().await;
+    if let Some(scope) = map.get_mut(scope_key)
+        && scope.active.as_ref().is_some_and(|a| a.task_id == task_id)
+    {
+        match scope.waiting.pop_front() {
+            Some(next) => scope.active = Some(next),
+            None => {
+                map.remove(scope_key);
+            }
+        }
+    }
+}
+
+/// A cancelled worker exits without touching `process_channel_message` but
+/// still owns its queue slot: if it was the active turn it hands the slot to
+/// the next waiter (atomic promotion), otherwise it drops itself from the
+/// waiting queue. `mark_done` is emitted afterwards so successors waiting on
+/// our completion can proceed.
+///
+/// The whole transition runs under one map lock: the promotion-or-removal of an
+/// active cancelled worker must not race with a registration (see
+/// `finish_active`), and a cancelled waiter removing itself must be atomic with
+/// the empty-record cleanup, otherwise a message registering in between could
+/// land in a record that is then deleted out from under it.
+async fn exit_tracked_state(
+    in_flight: &tokio::sync::Mutex<HashMap<String, InFlightScopeState>>,
+    scope_key: &str,
+    state: &InFlightSenderTaskState,
+) {
+    let mut map = in_flight.lock().await;
+    if let Some(scope) = map.get_mut(scope_key) {
+        if scope
+            .active
+            .as_ref()
+            .is_some_and(|a| a.task_id == state.task_id)
+        {
+            // We held the active slot: hand it to the next waiter, or drop the
+            // entry when the queue is empty, in the same lock that confirmed
+            // the slot was ours.
+            match scope.waiting.pop_front() {
+                Some(next) => scope.active = Some(next),
+                None => {
+                    map.remove(scope_key);
+                    state.completion.mark_done();
+                    return;
+                }
+            }
+        }
+        scope.waiting.retain(|s| s.task_id != state.task_id);
+        if scope.active.is_none() && scope.waiting.is_empty() {
+            map.remove(scope_key);
+        }
+    }
+    state.completion.mark_done();
 }
 
 /// Shared worker body extracted so both the normal path and the debounce path
@@ -7909,65 +7985,108 @@ async fn dispatch_worker(
     ctx: Arc<ChannelRuntimeContext>,
     msg: zeroclaw_api::channel::ChannelMessage,
     in_flight: Arc<tokio::sync::Mutex<HashMap<String, InFlightScopeState>>>,
+    semaphore: Arc<tokio::sync::Semaphore>,
     state: InFlightSenderTaskState,
     predecessor: Option<InFlightSenderTaskState>,
-    permit: tokio::sync::OwnedSemaphorePermit,
 ) {
-    let _permit = permit;
     let interrupt_enabled = ctx
         .interrupt_on_new_message
         .enabled_for_channel(msg.channel.as_str());
     let sender_scope_key = interruption_scope_key(&msg);
-    let register_in_flight = msg.channel != "cli" && !msg.passive_context;
+    let tracked = msg.channel != "cli" && !msg.passive_context;
 
-    if let Some(previous) = &predecessor {
-        if interrupt_enabled {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"sender": msg.sender})),
-                "interrupting previous in-flight request for sender"
-            );
-            previous.cancellation.cancel();
+    // Waiter loop: the predecessor is always the ACTIVE turn at registration
+    // time, but by the time we wake the active slot may belong to a newer
+    // successor (the previous holder promoted someone else via `finish_active`).
+    // So instead of assuming the slot is ours, we re-wait on whoever currently
+    // holds it. Cancelling the predecessor happens exactly once — only our
+    // registration-time predecessor, and only when interrupt is enabled; a
+    // successor promoted by the queue must never be cancelled by us.
+    let mut wait_on = predecessor;
+    let mut cancel_predecessor = true;
+    loop {
+        if let Some(previous) = wait_on.clone() {
+            if interrupt_enabled && cancel_predecessor {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"sender": msg.sender})),
+                    "interrupting previous in-flight request for sender"
+                );
+                previous.cancellation.cancel();
+            }
+            cancel_predecessor = false;
+            // Wait for the holder to finish, but also wake immediately if we
+            // are cancelled (e.g. /stop) instead of sleeping through a phase
+            // where the active turn ignores cancellation.
+            tokio::select! {
+                _ = previous.completion.wait() => {}
+                _ = state.cancellation.cancelled() => {}
+            }
+            // Cancellation point 1: may have been cancelled while waiting.
+            if state.cancellation.is_cancelled() {
+                exit_tracked_state(&in_flight, &sender_scope_key, &state).await;
+                return;
+            }
         }
-        // Serialize same-scope dispatches: even when interrupt_on_new_message is
-        // disabled, a new message must wait for the in-flight turn to complete
-        // instead of starting a concurrent run (duplicate answers/side effects).
-        previous.completion.wait().await;
+        if !tracked {
+            break;
+        }
+        // Promotion is done exclusively by `finish_active` in the active worker;
+        // we only verify whether the active slot is ours, and if not, re-wait on
+        // the current holder. A worker never promotes itself.
+        enum Slot {
+            Active,
+            Waiting(Option<InFlightSenderTaskState>),
+            Gone,
+        }
+        let slot = {
+            let mut map = in_flight.lock().await;
+            match map.get_mut(&sender_scope_key) {
+                None => Slot::Gone,
+                Some(scope)
+                    if scope
+                        .active
+                        .as_ref()
+                        .is_some_and(|a| a.task_id == state.task_id) =>
+                {
+                    Slot::Active
+                }
+                Some(scope) => Slot::Waiting(scope.active.clone()),
+            }
+        };
+        match slot {
+            Slot::Gone => {
+                state.completion.mark_done();
+                return;
+            }
+            Slot::Active => break,
+            Slot::Waiting(next) => wait_on = next,
+        }
     }
-
-    // /stop may have cancelled us while we were queued: exit without doing work
-    // but still release the next waiter.
+    // Cancellation points 2+3: nothing awaits between confirming we hold the
+    // active slot and taking the permit, so one check covers both windows.
     if state.cancellation.is_cancelled() {
-        state.completion.mark_done();
+        exit_tracked_state(&in_flight, &sender_scope_key, &state).await;
         return;
     }
-
-    // Promotion: the predecessor finished, we are the next in line. If the
-    // scope entry was already removed (e.g. by /stop), re-create it empty.
-    if register_in_flight {
-        let mut map = in_flight.lock().await;
-        let scope = map.entry(sender_scope_key.clone()).or_default();
-        if scope.active.is_none() {
-            scope.waiting.retain(|s| s.task_id != state.task_id);
-            scope.active = Some(state.clone());
+    // The global permit is taken only now, after promotion: waiting and
+    // cancelled workers hold no permits, so a slow scope cannot consume the
+    // whole semaphore and starve unrelated senders. A cancelled worker never
+    // reaches here; the taken permit lives until the end of the worker.
+    let _permit = match semaphore.acquire_owned().await {
+        Ok(permit) => permit,
+        Err(_) => {
+            state.completion.mark_done();
+            return;
         }
-    }
-
+    };
     process_channel_message(ctx, msg, state.cancellation.clone()).await;
-
-    if register_in_flight {
-        let mut map = in_flight.lock().await;
-        if map.get(&sender_scope_key).is_some_and(|scope| {
-            scope
-                .active
-                .as_ref()
-                .is_some_and(|active| active.task_id == state.task_id)
-        }) {
-            map.remove(&sender_scope_key);
-        }
+    if tracked {
+        // Hand the slot to the next waiter (or drop the entry) BEFORE marking
+        // done, so a successor woken by `mark_done` already sees the promotion.
+        finish_active(&in_flight, &sender_scope_key, state.task_id).await;
     }
-
     state.completion.mark_done();
 }
 
@@ -8621,8 +8740,8 @@ async fn run_message_dispatch_loop(
                     // worker path below.
                     let debounce_ctx = Arc::clone(&ctx);
                     let debounce_in_flight = Arc::clone(&in_flight_by_sender);
-                    let debounce_semaphore = Arc::clone(&semaphore);
                     let debounce_task_seq = Arc::clone(&task_sequence);
+                    let debounce_semaphore = Arc::clone(&semaphore);
                     let mut debounce_msg = msg;
                     workers.spawn(async move {
                         let combined = match rx.await {
@@ -8634,11 +8753,6 @@ async fn run_message_dispatch_loop(
                         };
                         debounce_msg.content = combined;
                         ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"channel": debounce_msg.channel, "sender": debounce_msg.sender})), "Debounced message ready — dispatching combined message");
-
-                        let permit = match debounce_semaphore.acquire_owned().await {
-                            Ok(permit) => permit,
-                            Err(_) => return,
-                        };
 
                         let task_id = debounce_task_seq.fetch_add(1, Ordering::Relaxed);
                         let cancellation_token = CancellationToken::new();
@@ -8661,13 +8775,16 @@ async fn run_message_dispatch_loop(
                             None
                         };
 
+                        // The global semaphore is passed to the worker and taken
+                        // only after promotion, so queued debounced messages hold
+                        // no permits (see `dispatch_worker`).
                         dispatch_worker(
                             debounce_ctx,
                             debounce_msg,
                             debounce_in_flight,
+                            Arc::clone(&debounce_semaphore),
                             state,
                             predecessor,
-                            permit,
                         )
                         .await;
                     });
@@ -8681,11 +8798,6 @@ async fn run_message_dispatch_loop(
             }
         } else {
             msg
-        };
-
-        let permit = match Arc::clone(&semaphore).acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => break,
         };
 
         // Admission happens here, in the receiver task, so same-scope turns are
@@ -8711,8 +8823,17 @@ async fn run_message_dispatch_loop(
 
         let worker_ctx = Arc::clone(&ctx);
         let in_flight = Arc::clone(&in_flight_by_sender);
+        let worker_semaphore = Arc::clone(&semaphore);
         workers.spawn(async move {
-            dispatch_worker(worker_ctx, msg, in_flight, state, predecessor, permit).await;
+            dispatch_worker(
+                worker_ctx,
+                msg,
+                in_flight,
+                Arc::clone(&worker_semaphore),
+                state,
+                predecessor,
+            )
+            .await;
         });
 
         while let Some(result) = workers.try_join_next() {
@@ -18817,6 +18938,125 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
+    /// Provider that blocks selected calls behind a `release` Notify so tests can
+    /// pin a turn mid-flight and observe what the dispatch machinery does in the
+    /// meantime. `classifier_gate` gates the first `chat_with_system` call (the
+    /// reply-intent precheck runs before the main agent loop and ignores
+    /// cancellation); `gate_first_history_call` gates the first `chat_with_history`
+    /// call (inside the agent loop, which observes cancellation). `calls` records
+    /// every started history call, `completed` only those that passed the gate —
+    /// so tests can distinguish "started but cancelled" from "finished".
+    struct GatedCallSequenceProvider {
+        classifier_gate: bool,
+        gate_first_history_call: bool,
+        release: Arc<tokio::sync::Notify>,
+        first_gated_call_started: Arc<tokio::sync::Notify>,
+        calls: std::sync::Mutex<Vec<Vec<(String, String)>>>,
+        completed: std::sync::Mutex<Vec<Vec<(String, String)>>>,
+        classifier_calls: AtomicUsize,
+        history_calls: AtomicUsize,
+        in_flight: Arc<AtomicUsize>,
+        peak_in_flight: Arc<AtomicUsize>,
+    }
+
+    impl GatedCallSequenceProvider {
+        async fn wait_for_release(&self) {
+            // Register the waiter before awaiting so a release racing the gate
+            // registration is not lost (same idiom as InFlightTaskCompletion::wait).
+            let notified = self.release.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            notified.await;
+        }
+    }
+
+    /// Releases the in-flight counter when the call ends, including when it is
+    /// cancelled mid-gate: the agent loop aborts the provider future, so a
+    /// plain decrement after the gate would leak the count.
+    struct InFlightCounter(Arc<AtomicUsize>);
+
+    impl Drop for InFlightCounter {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for GatedCallSequenceProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            if self.classifier_gate && self.classifier_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.first_gated_call_started.notify_waiters();
+                self.wait_for_release().await;
+            }
+            Ok("REPLY".to_string())
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            let snapshot = messages
+                .iter()
+                .map(|m| (m.role.clone(), m.content.clone()))
+                .collect::<Vec<_>>();
+            // Gate the first history call only; the FIFO queue guarantees the
+            // first call belongs to the first (active) turn in every test.
+            let gated = self.gate_first_history_call
+                && self.history_calls.fetch_add(1, Ordering::SeqCst) == 0;
+            let call_index = {
+                let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
+                calls.push(snapshot.clone());
+                calls.len()
+            };
+            // Count the call from entry so a gated turn sits inside the
+            // in-flight window; the Drop guard releases the count even when
+            // the call is cancelled mid-gate (see `InFlightCounter`).
+            let _in_flight = InFlightCounter(self.in_flight.clone());
+            let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            let mut peak = self.peak_in_flight.load(Ordering::SeqCst);
+            while current > peak {
+                match self.peak_in_flight.compare_exchange(
+                    peak,
+                    current,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => peak = actual,
+                }
+            }
+            if gated {
+                self.first_gated_call_started.notify_waiters();
+                self.wait_for_release().await;
+            }
+            {
+                let mut completed = self.completed.lock().unwrap_or_else(|e| e.into_inner());
+                completed.push(snapshot);
+            }
+            Ok(format!("response-{call_index}"))
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for GatedCallSequenceProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "GatedCallSequenceProvider"
+        }
+    }
+
     struct MockPriceTool;
 
     impl ::zeroclaw_api::attribution::Attributable for MockPriceTool {
@@ -22550,6 +22790,550 @@ BTC is currently around $65,000 based on latest tool output."#
             sent_messages[1].contains("response-2"),
             "second delivered reply must be response-2, got {:?}",
             sent_messages[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn message_dispatch_handoff_is_atomic_with_late_arrival() {
+        // A is gated mid-flight with B queued. A new message D lands exactly as
+        // A finishes: the handoff must be atomic, so D either joins the queue
+        // behind B (A's finish_active already promoted B) or becomes the new
+        // active (the entry was removed), never racing B. Either way the three
+        // turns run strictly in order with no overlap.
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        let first_gated_call_started = Arc::new(tokio::sync::Notify::new());
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak_in_flight = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(GatedCallSequenceProvider {
+            classifier_gate: false,
+            gate_first_history_call: true,
+            release: release.clone(),
+            first_gated_call_started: first_gated_call_started.clone(),
+            calls: std::sync::Mutex::new(Vec::new()),
+            completed: std::sync::Mutex::new(Vec::new()),
+            classifier_calls: AtomicUsize::new(0),
+            history_calls: AtomicUsize::new(0),
+            in_flight: in_flight.clone(),
+            peak_in_flight: peak_in_flight.clone(),
+        });
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider.clone(),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let loop_task = ::zeroclaw_spawn::spawn!(run_message_dispatch_loop(
+            rx,
+            AgentRouter::single(runtime_ctx),
+            4
+        ));
+        for (id, content, ts) in [("1", "first", 1u64), ("2", "second", 2)] {
+            tx.send(zeroclaw_api::channel::ChannelMessage {
+                id: id.into(),
+                sender: "alice".into(),
+                reply_target: "chat-1".into(),
+                content: content.into(),
+                channel: "test-channel".into(),
+                timestamp: ts,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(2), first_gated_call_started.notified())
+            .await
+            .expect("first turn must gate in the provider");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        // Release A and immediately enqueue D; the loop must still serialize.
+        release.notify_waiters();
+        tx.send(zeroclaw_api::channel::ChannelMessage {
+            id: "3".into(),
+            sender: "alice".into(),
+            reply_target: "chat-1".into(),
+            content: "third".into(),
+            channel: "test-channel".into(),
+            timestamp: 3,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(2), loop_task)
+            .await
+            .expect("dispatch loop must drain all three messages")
+            .unwrap();
+
+        let peak = peak_in_flight.load(Ordering::SeqCst);
+        assert_eq!(
+            peak, 1,
+            "late arrival must never overlap the promoted successor, got peak concurrency {}",
+            peak
+        );
+        assert_eq!(in_flight.load(Ordering::SeqCst), 0);
+
+        {
+            let completed = provider.completed.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(completed.len(), 3, "all three turns must run");
+            for (i, expected) in ["first", "second", "third"].iter().enumerate() {
+                assert!(
+                    completed[i]
+                        .iter()
+                        .any(|(role, content)| role == "user" && content.contains(expected)),
+                    "completed call {} must carry {:?}, got {:?}",
+                    i,
+                    expected,
+                    completed[i]
+                );
+            }
+        }
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent_messages.len(), 3);
+        assert!(
+            sent_messages[0].contains("response-1") && sent_messages[1].contains("response-2"),
+            "replies must arrive in handoff order, got {:?}",
+            *sent_messages
+        );
+        assert!(
+            sent_messages[2].contains("response-3"),
+            "late arrival must get the final reply, got {:?}",
+            sent_messages[2]
+        );
+    }
+
+    #[tokio::test]
+    async fn message_dispatch_waiting_queue_does_not_starve_other_senders() {
+        // A (gated) and B (waiting) share one scope; C is a different sender.
+        // Waiting workers must hold no semaphore permit, so C is dispatched and
+        // completes while A is still pinned — the queue cannot eat the global
+        // permit pool (the old receiver-side acquire would block C's spawn).
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        let first_gated_call_started = Arc::new(tokio::sync::Notify::new());
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak_in_flight = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(GatedCallSequenceProvider {
+            classifier_gate: false,
+            gate_first_history_call: true,
+            release: release.clone(),
+            first_gated_call_started: first_gated_call_started.clone(),
+            calls: std::sync::Mutex::new(Vec::new()),
+            completed: std::sync::Mutex::new(Vec::new()),
+            classifier_calls: AtomicUsize::new(0),
+            history_calls: AtomicUsize::new(0),
+            in_flight: in_flight.clone(),
+            peak_in_flight: peak_in_flight.clone(),
+        });
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider.clone(),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        // Two permits: A and B would exhaust them on the old receiver-side
+        // acquire, so C could never even be dispatched.
+        let loop_task = ::zeroclaw_spawn::spawn!(run_message_dispatch_loop(
+            rx,
+            AgentRouter::single(runtime_ctx),
+            2
+        ));
+        tx.send(zeroclaw_api::channel::ChannelMessage {
+            id: "1".into(),
+            sender: "alice".into(),
+            reply_target: "chat-1".into(),
+            content: "first".into(),
+            channel: "test-channel".into(),
+            timestamp: 1,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), first_gated_call_started.notified())
+            .await
+            .expect("first turn must gate in the provider");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        tx.send(zeroclaw_api::channel::ChannelMessage {
+            id: "2".into(),
+            sender: "alice".into(),
+            reply_target: "chat-1".into(),
+            content: "second".into(),
+            channel: "test-channel".into(),
+            timestamp: 2,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        tx.send(zeroclaw_api::channel::ChannelMessage {
+            id: "3".into(),
+            sender: "bob".into(),
+            reply_target: "chat-2".into(),
+            content: "hello".into(),
+            channel: "test-channel".into(),
+            timestamp: 3,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        // C must complete while A is still gated; poll instead of sleeping so
+        // the assertion is about progress, not timing.
+        let poll_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let any_completed = {
+                let completed = provider.completed.lock().unwrap_or_else(|e| e.into_inner());
+                !completed.is_empty()
+            };
+            if any_completed {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < poll_deadline,
+                "other-sender message starved behind a waiting queue"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        release.notify_waiters();
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(2), loop_task)
+            .await
+            .expect("dispatch loop must drain all three messages")
+            .unwrap();
+
+        {
+            let calls = provider.calls.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(calls.len(), 3, "all three turns must reach the provider");
+            let completed = provider.completed.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(completed.len(), 3, "all three turns must complete");
+            assert!(
+                completed.iter().any(|c| c
+                    .iter()
+                    .any(|(role, content)| role == "user" && content.contains("hello"))),
+                "other-sender turn must have run, got {:?}",
+                *completed
+            );
+        }
+        let peak = peak_in_flight.load(Ordering::SeqCst);
+        assert!(
+            peak >= 2,
+            "different scopes must still run concurrently, got peak {}",
+            peak
+        );
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent_messages.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn message_dispatch_stop_wakes_waiting_successor_without_running_it() {
+        // A is gated inside the agent loop (cancellation-sensitive) and B waits
+        // behind it. /stop cancels both; B must wake via the select on its own
+        // cancellation instead of sleeping until A completes, and must never
+        // start processing (no provider call, no permit taken).
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        let first_gated_call_started = Arc::new(tokio::sync::Notify::new());
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak_in_flight = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(GatedCallSequenceProvider {
+            classifier_gate: false,
+            gate_first_history_call: true,
+            release: release.clone(),
+            first_gated_call_started: first_gated_call_started.clone(),
+            calls: std::sync::Mutex::new(Vec::new()),
+            completed: std::sync::Mutex::new(Vec::new()),
+            classifier_calls: AtomicUsize::new(0),
+            history_calls: AtomicUsize::new(0),
+            in_flight: in_flight.clone(),
+            peak_in_flight: peak_in_flight.clone(),
+        });
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider.clone(),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let loop_task = ::zeroclaw_spawn::spawn!(run_message_dispatch_loop(
+            rx,
+            AgentRouter::single(runtime_ctx),
+            4
+        ));
+        tx.send(zeroclaw_api::channel::ChannelMessage {
+            id: "msg-1".into(),
+            sender: "alice".into(),
+            reply_target: "chat-1".into(),
+            content: "first".into(),
+            channel: "test-channel".into(),
+            timestamp: 1,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), first_gated_call_started.notified())
+            .await
+            .expect("first turn must gate in the provider");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        tx.send(zeroclaw_api::channel::ChannelMessage {
+            id: "msg-2".into(),
+            sender: "alice".into(),
+            reply_target: "chat-1".into(),
+            content: "second".into(),
+            channel: "test-channel".into(),
+            timestamp: 2,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        tx.send(zeroclaw_api::channel::ChannelMessage {
+            id: "msg-3".into(),
+            sender: "alice".into(),
+            reply_target: "chat-1".into(),
+            content: "/stop".into(),
+            channel: "test-channel".into(),
+            timestamp: 3,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        // The loop must terminate promptly even though the release is never
+        // fired: the waiting successor wakes on cancellation, not on completion.
+        tokio::time::timeout(Duration::from_secs(2), loop_task)
+            .await
+            .expect("dispatch loop must terminate after /stop without releasing the gate")
+            .unwrap();
+
+        {
+            let calls = provider.calls.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                calls.len(),
+                1,
+                "queued successor must never start processing, got {} provider calls",
+                calls.len()
+            );
+            let completed = provider.completed.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(completed.len(), 0, "no turn may finish while gated");
+        }
+        assert_eq!(in_flight.load(Ordering::SeqCst), 0, "no permit may be held");
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(
+            sent_messages.len(),
+            1,
+            "expected only the stop-ack reply, got {:?}",
+            *sent_messages
+        );
+        assert!(
+            sent_messages[0].starts_with("chat-1:"),
+            "stop-ack must be addressed to chat-1, got {:?}",
+            sent_messages[0]
+        );
+        assert!(
+            !sent_messages[0].contains("response"),
+            "cancelled active turn must not deliver a final response, got {:?}",
+            sent_messages[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn message_dispatch_interrupt_cancels_active_not_queue_tail() {
+        // Telegram interrupts the RUNNING turn: with A gated in the classifier
+        // precheck (cancellation-insensitive) and B, C queued, both successors
+        // must cancel A — never the queue tail. So B runs, then C, and the queue
+        // keeps its order; the old tail-based predecessor would cancel B and
+        // drop it.
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        let first_gated_call_started = Arc::new(tokio::sync::Notify::new());
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak_in_flight = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(GatedCallSequenceProvider {
+            classifier_gate: true,
+            gate_first_history_call: false,
+            release: release.clone(),
+            first_gated_call_started: first_gated_call_started.clone(),
+            calls: std::sync::Mutex::new(Vec::new()),
+            completed: std::sync::Mutex::new(Vec::new()),
+            classifier_calls: AtomicUsize::new(0),
+            history_calls: AtomicUsize::new(0),
+            in_flight: in_flight.clone(),
+            peak_in_flight: peak_in_flight.clone(),
+        });
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider: provider.clone(),
+            model_provider_ref: Arc::new("test-provider".to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+            memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: true,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                whatsapp: false,
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let loop_task = ::zeroclaw_spawn::spawn!(run_message_dispatch_loop(
+            rx,
+            AgentRouter::single(runtime_ctx),
+            4
+        ));
+        tx.send(zeroclaw_api::channel::ChannelMessage {
+            id: "msg-1".into(),
+            sender: "alice".into(),
+            reply_target: "chat-1".into(),
+            content: "first".into(),
+            channel: "telegram".into(),
+            timestamp: 1,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        // A is pinned in the classifier precheck, which is outside the agent
+        // loop and ignores cancellation; it stays gated until released.
+        tokio::time::timeout(Duration::from_secs(2), first_gated_call_started.notified())
+            .await
+            .expect("first turn must gate in the classifier precheck");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        for (id, content, ts) in [("msg-2", "second", 2u64), ("msg-3", "third", 3)] {
+            tx.send(zeroclaw_api::channel::ChannelMessage {
+                id: id.into(),
+                sender: "alice".into(),
+                reply_target: "chat-1".into(),
+                content: content.into(),
+                channel: "telegram".into(),
+                timestamp: ts,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        release.notify_waiters();
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(2), loop_task)
+            .await
+            .expect("dispatch loop must drain all messages after release")
+            .unwrap();
+
+        {
+            let calls = provider.calls.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                calls.len(),
+                2,
+                "interrupted active turn must not reach the agent loop; only the two queued successors run, got {}",
+                calls.len()
+            );
+            let completed = provider.completed.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(completed.len(), 2);
+            assert!(
+                completed[0]
+                    .iter()
+                    .any(|(role, content)| role == "user" && content.contains("second")),
+                "queue head must run first, got {:?}",
+                completed[0]
+            );
+            assert!(
+                completed[1]
+                    .iter()
+                    .any(|(role, content)| role == "user" && content.contains("third")),
+                "queue tail must follow in order, got {:?}",
+                completed[1]
+            );
+        }
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent_messages.len(), 2);
+        assert!(
+            sent_messages[0].contains("response-1") && sent_messages[1].contains("response-2"),
+            "queue order must map to reply order, got {:?}",
+            *sent_messages
         );
     }
 
