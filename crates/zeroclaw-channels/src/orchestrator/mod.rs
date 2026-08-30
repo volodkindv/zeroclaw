@@ -7888,20 +7888,38 @@ async fn process_channel_message_body(
 /// turn (a queued successor has nothing to cancel yet), and without it the new
 /// worker waits on the running turn — promotion through the queue is handled by
 /// the active worker alone (see `finish_active`).
+/// Result of admitting a message into the per-scope FIFO queue.
+enum RegisterOutcome {
+    /// The message became the active turn (no predecessor to wait for).
+    Active,
+    /// The message joined the waiting queue; the value is the active turn it
+    /// must wait for (always `Some` at registration time — an entry with a
+    /// waiting queue always has an active slot).
+    Queued(Option<InFlightSenderTaskState>),
+    /// The per-scope backlog limit was reached; the message was rejected with
+    /// the explicit full-queue policy (drop + warning) and must not be spawned.
+    QueueFull,
+}
+
 async fn register_in_flight(
     in_flight: &tokio::sync::Mutex<HashMap<String, InFlightScopeState>>,
     scope_key: &str,
     state: InFlightSenderTaskState,
-) -> Option<InFlightSenderTaskState> {
+    backlog_limit: usize,
+) -> RegisterOutcome {
     let mut map = in_flight.lock().await;
     let scope = map.entry(scope_key.to_string()).or_default();
     if scope.active.is_none() {
         scope.active = Some(state);
-        None
+        RegisterOutcome::Active
+    } else if scope.waiting.len() >= backlog_limit {
+        // Explicit full-queue policy: reject the message. The entry is
+        // guaranteed non-empty here (active is Some), so nothing to clean up.
+        RegisterOutcome::QueueFull
     } else {
         let predecessor = scope.active.clone();
         scope.waiting.push_back(state);
-        predecessor
+        RegisterOutcome::Queued(predecessor)
     }
 }
 
@@ -8074,10 +8092,20 @@ async fn dispatch_worker(
     // cancelled workers hold no permits, so a slow scope cannot consume the
     // whole semaphore and starve unrelated senders. A cancelled worker never
     // reaches here; the taken permit lives until the end of the worker.
-    let _permit = match semaphore.acquire_owned().await {
-        Ok(permit) => permit,
-        Err(_) => {
-            state.completion.mark_done();
+    // The wait itself is cancellable: if /stop cancels us while every permit
+    // is held by unrelated scopes, we must wake and exit through
+    // `exit_tracked_state` instead of sleeping in the JoinSet until a foreign
+    // turn releases a permit (which would block dispatch shutdown).
+    let _permit = tokio::select! {
+        permit = semaphore.acquire_owned() => match permit {
+            Ok(permit) => permit,
+            Err(_) => {
+                state.completion.mark_done();
+                return;
+            }
+        },
+        _ = state.cancellation.cancelled() => {
+            exit_tracked_state(&in_flight, &sender_scope_key, &state).await;
             return;
         }
     };
@@ -8742,6 +8770,8 @@ async fn run_message_dispatch_loop(
                     let debounce_in_flight = Arc::clone(&in_flight_by_sender);
                     let debounce_task_seq = Arc::clone(&task_sequence);
                     let debounce_semaphore = Arc::clone(&semaphore);
+                    // Same per-scope backlog bound as the normal path.
+                    let debounce_backlog_limit = max_in_flight_messages;
                     let mut debounce_msg = msg;
                     workers.spawn(async move {
                         let combined = match rx.await {
@@ -8765,12 +8795,27 @@ async fn run_message_dispatch_loop(
                         let predecessor = if debounce_msg.channel != "cli"
                             && !debounce_msg.passive_context
                         {
-                            register_in_flight(
+                            match register_in_flight(
                                 &debounce_in_flight,
                                 &interruption_scope_key(&debounce_msg),
                                 state.clone(),
+                                debounce_backlog_limit,
                             )
                             .await
+                            {
+                                RegisterOutcome::Active => None,
+                                RegisterOutcome::Queued(predecessor) => predecessor,
+                                RegisterOutcome::QueueFull => {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                            .with_attrs(::serde_json::json!({"channel": debounce_msg.channel, "sender": debounce_msg.sender})),
+                                        "dropping debounced channel message: per-scope queue is full"
+                                    );
+                                    return;
+                                }
+                            }
                         } else {
                             None
                         };
@@ -8811,12 +8856,34 @@ async fn run_message_dispatch_loop(
             completion: Arc::clone(&completion),
         };
         let predecessor = if msg.channel != "cli" && !msg.passive_context {
-            register_in_flight(
+            match register_in_flight(
                 &in_flight_by_sender,
                 &interruption_scope_key(&msg),
                 state.clone(),
+                // The per-scope backlog is capped by the same global budget:
+                // one slow scope may hold at most `max_in_flight_messages`
+                // queued turns (plus its active turn), so a flood behind it
+                // cannot grow memory without the configured bound. When the
+                // queue is full the message is rejected (explicit policy).
+                max_in_flight_messages,
             )
             .await
+            {
+                RegisterOutcome::Active => None,
+                RegisterOutcome::Queued(predecessor) => predecessor,
+                RegisterOutcome::QueueFull => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(
+                                ::serde_json::json!({"channel": msg.channel, "sender": msg.sender})
+                            ),
+                        "dropping channel message: per-scope queue is full"
+                    );
+                    continue;
+                }
+            }
         } else {
             None
         };
@@ -22851,7 +22918,40 @@ BTC is currently around $65,000 based on latest tool output."#
         tokio::time::timeout(Duration::from_secs(2), first_gated_call_started.notified())
             .await
             .expect("first turn must gate in the provider");
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        // Deterministic replacement for the old fixed sleep: prove B ("second")
+        // is already queued before D arrives by completing a marker message
+        // from a DIFFERENT scope that was sent after B. The receiver admits
+        // messages in channel order, so the marker can only complete after B
+        // was registered (queued behind the gated A). No timing assumption.
+        tx.send(zeroclaw_api::channel::ChannelMessage {
+            id: "marker".into(),
+            sender: "bob".into(),
+            reply_target: "chat-2".into(),
+            content: "hello".into(),
+            channel: "test-channel".into(),
+            timestamp: 2,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let poll_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let marker_done = {
+                let completed = provider.completed.lock().unwrap_or_else(|e| e.into_inner());
+                completed.iter().any(|turn| {
+                    turn.iter()
+                        .any(|(role, content)| role == "user" && content.contains("hello"))
+                })
+            };
+            if marker_done {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < poll_deadline,
+                "marker turn must complete while A is gated, proving B is queued"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         // Release A and immediately enqueue D; the loop must still serialize.
         release.notify_waiters();
         tx.send(zeroclaw_api::channel::ChannelMessage {
@@ -22868,43 +22968,92 @@ BTC is currently around $65,000 based on latest tool output."#
         drop(tx);
         tokio::time::timeout(Duration::from_secs(2), loop_task)
             .await
-            .expect("dispatch loop must drain all three messages")
+            .expect("dispatch loop must drain all messages")
             .unwrap();
 
-        let peak = peak_in_flight.load(Ordering::SeqCst);
-        assert_eq!(
-            peak, 1,
-            "late arrival must never overlap the promoted successor, got peak concurrency {}",
-            peak
-        );
+        // The marker ran concurrently with the gated A (different scope) while
+        // the same-scope turns were serialized; the invariant under test is the
+        // handoff order, so assert the relative order instead of a global peak.
         assert_eq!(in_flight.load(Ordering::SeqCst), 0);
 
         {
             let completed = provider.completed.lock().unwrap_or_else(|e| e.into_inner());
-            assert_eq!(completed.len(), 3, "all three turns must run");
-            for (i, expected) in ["first", "second", "third"].iter().enumerate() {
-                assert!(
-                    completed[i]
-                        .iter()
-                        .any(|(role, content)| role == "user" && content.contains(expected)),
-                    "completed call {} must carry {:?}, got {:?}",
-                    i,
-                    expected,
-                    completed[i]
-                );
-            }
+            assert_eq!(completed.len(), 4, "all four turns must run");
+            assert!(
+                completed.iter().any(|turn| turn
+                    .iter()
+                    .any(|(role, content)| role == "user" && content.contains("first"))),
+                "first turn must run"
+            );
+            assert!(
+                completed.iter().any(|turn| turn
+                    .iter()
+                    .any(|(role, content)| role == "user" && content.contains("hello"))),
+                "marker turn must run"
+            );
+            let idx_second = completed
+                .iter()
+                .position(|turn| {
+                    turn.iter()
+                        .any(|(role, content)| role == "user" && content.contains("second"))
+                })
+                .expect("second turn must run");
+            let idx_third = completed
+                .iter()
+                .position(|turn| {
+                    turn.iter()
+                        .any(|(role, content)| role == "user" && content.contains("third"))
+                })
+                .expect("third turn must run");
+            assert!(
+                idx_second < idx_third,
+                "queued successor must run before the late arrival, got {:?}",
+                *completed
+            );
         }
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent_messages.len(), 3);
+        assert_eq!(sent_messages.len(), 4);
+        // Replies are numbered by provider call order: first=response-1,
+        // marker=response-2 (different scope, runs while alice's turn is
+        // gated), second=response-3, third=response-4. The marker reply
+        // arriving proves the queue was already formed when it completed
+        // (see the poll above), so no timing assumption is needed.
         assert!(
-            sent_messages[0].contains("response-1") && sent_messages[1].contains("response-2"),
-            "replies must arrive in handoff order, got {:?}",
+            sent_messages
+                .iter()
+                .any(|m| m.contains("chat-1:response-1")),
+            "first reply must arrive in chat-1, got {:?}",
             *sent_messages
         );
         assert!(
-            sent_messages[2].contains("response-3"),
-            "late arrival must get the final reply, got {:?}",
-            sent_messages[2]
+            sent_messages
+                .iter()
+                .any(|m| m.contains("chat-2:response-2")),
+            "marker reply must arrive in chat-2, got {:?}",
+            *sent_messages
+        );
+        // The handoff order itself is asserted on `completed` above (second
+        // strictly before third); here we just pin the delivery targets:
+        // chat-1 gets first+second+third, chat-2 gets only the marker.
+        let chat1: Vec<_> = sent_messages
+            .iter()
+            .filter(|m| m.starts_with("chat-1:"))
+            .collect();
+        let chat2: Vec<_> = sent_messages
+            .iter()
+            .filter(|m| m.starts_with("chat-2:"))
+            .collect();
+        assert_eq!(
+            chat1.len(),
+            3,
+            "chat-1 must get first+second+third, got {:?}",
+            *sent_messages
+        );
+        assert_eq!(
+            chat2.len(),
+            1,
+            "chat-2 must get only the marker reply, got {:?}",
+            *sent_messages
         );
     }
 
@@ -23150,6 +23299,433 @@ BTC is currently around $65,000 based on latest tool output."#
             !sent_messages[0].contains("response"),
             "cancelled active turn must not deliver a final response, got {:?}",
             sent_messages[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn message_dispatch_cancelled_permit_wait_shuts_down() {
+        // Blocker-1 regression: a worker that was promoted to the active slot
+        // and is waiting on the global execution permit must wake on
+        // cancellation. Scenario: alice's turn holds the only permit (gated),
+        // bob's turn is promoted for its own scope and blocks on
+        // `acquire_owned`, then /stop cancels bob. The loop must then finish
+        // without bob ever acquiring the permit — even though the unrelated
+        // gated turn (which owns it) only releases at the very end.
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        let first_gated_call_started = Arc::new(tokio::sync::Notify::new());
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak_in_flight = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(GatedCallSequenceProvider {
+            classifier_gate: false,
+            gate_first_history_call: true,
+            release: release.clone(),
+            first_gated_call_started: first_gated_call_started.clone(),
+            calls: std::sync::Mutex::new(Vec::new()),
+            completed: std::sync::Mutex::new(Vec::new()),
+            classifier_calls: AtomicUsize::new(0),
+            history_calls: AtomicUsize::new(0),
+            in_flight: in_flight.clone(),
+            peak_in_flight: peak_in_flight.clone(),
+        });
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider.clone(),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        // A single execution permit: bob can only ever wait on it while alice
+        // holds it.
+        let loop_task = ::zeroclaw_spawn::spawn!(run_message_dispatch_loop(
+            rx,
+            AgentRouter::single(runtime_ctx),
+            1
+        ));
+        tx.send(zeroclaw_api::channel::ChannelMessage {
+            id: "1".into(),
+            sender: "alice".into(),
+            reply_target: "chat-1".into(),
+            content: "first".into(),
+            channel: "test-channel".into(),
+            timestamp: 1,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), first_gated_call_started.notified())
+            .await
+            .expect("first turn must gate in the provider");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        // bob is promoted for its own scope and must now be parked on the
+        // permit acquire, with alice holding the only permit.
+        tx.send(zeroclaw_api::channel::ChannelMessage {
+            id: "2".into(),
+            sender: "bob".into(),
+            reply_target: "chat-2".into(),
+            content: "hello".into(),
+            channel: "test-channel".into(),
+            timestamp: 2,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        // /stop cancels bob's scope; the permit wait must be cancellable.
+        tx.send(zeroclaw_api::channel::ChannelMessage {
+            id: "3".into(),
+            sender: "bob".into(),
+            reply_target: "chat-2".into(),
+            content: "/stop".into(),
+            channel: "test-channel".into(),
+            timestamp: 3,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        // Give the cancellation branch time to run while alice is still gated.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        // Now release the unrelated permit. If bob were still parked on
+        // `acquire_owned` it would acquire the freed permit and run; with the
+        // fix it already exited and never touches the provider.
+        release.notify_waiters();
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(2), loop_task)
+            .await
+            .expect("dispatch loop must shut down after /stop")
+            .unwrap();
+
+        {
+            let calls = provider.calls.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                calls.len(),
+                1,
+                "cancelled permit-waiting worker must never start processing, got {} provider calls",
+                calls.len()
+            );
+            let completed = provider.completed.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(completed.len(), 1, "only the unrelated turn may complete");
+            assert!(
+                completed[0]
+                    .iter()
+                    .any(|(role, content)| role == "user" && content.contains("first")),
+                "only alice's turn must run, got {:?}",
+                *completed
+            );
+        }
+        assert_eq!(in_flight.load(Ordering::SeqCst), 0, "no permit may be held");
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(
+            sent_messages.len(),
+            2,
+            "response-1 plus the stop-ack, got {:?}",
+            *sent_messages
+        );
+        assert!(
+            sent_messages.iter().any(|m| m.contains("response-1")),
+            "alice's response must be delivered, got {:?}",
+            *sent_messages
+        );
+        assert!(
+            sent_messages.iter().any(|m| m.starts_with("chat-2:")),
+            "stop-ack must be addressed to bob's chat, got {:?}",
+            *sent_messages
+        );
+    }
+
+    #[tokio::test]
+    async fn message_dispatch_scope_backlog_bounded_and_other_scopes_progress() {
+        // Blocker-2 regression: per-scope backlog is bounded, so a flood behind
+        // one slow scope is rejected (explicit drop policy) instead of growing
+        // the queue without limit, while unrelated scopes keep making progress.
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        let first_gated_call_started = Arc::new(tokio::sync::Notify::new());
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak_in_flight = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(GatedCallSequenceProvider {
+            classifier_gate: false,
+            gate_first_history_call: true,
+            release: release.clone(),
+            first_gated_call_started: first_gated_call_started.clone(),
+            calls: std::sync::Mutex::new(Vec::new()),
+            completed: std::sync::Mutex::new(Vec::new()),
+            classifier_calls: AtomicUsize::new(0),
+            history_calls: AtomicUsize::new(0),
+            in_flight: in_flight.clone(),
+            peak_in_flight: peak_in_flight.clone(),
+        });
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider.clone(),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(16);
+        // max_in_flight = 2 doubles as the per-scope backlog limit: alice may
+        // hold one active turn plus two queued; "fourth"/"fifth" must be
+        // rejected while bob (unrelated scope) still runs concurrently.
+        let loop_task = ::zeroclaw_spawn::spawn!(run_message_dispatch_loop(
+            rx,
+            AgentRouter::single(runtime_ctx),
+            2
+        ));
+        for (id, content, ts) in [
+            ("1", "first", 1u64),
+            ("2", "second", 2),
+            ("3", "third", 3),
+            ("4", "fourth", 4),
+            ("5", "fifth", 5),
+        ] {
+            tx.send(zeroclaw_api::channel::ChannelMessage {
+                id: id.into(),
+                sender: "alice".into(),
+                reply_target: "chat-1".into(),
+                content: content.into(),
+                channel: "test-channel".into(),
+                timestamp: ts,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(2), first_gated_call_started.notified())
+            .await
+            .expect("first turn must gate in the provider");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        tx.send(zeroclaw_api::channel::ChannelMessage {
+            id: "6".into(),
+            sender: "bob".into(),
+            reply_target: "chat-2".into(),
+            content: "hello".into(),
+            channel: "test-channel".into(),
+            timestamp: 6,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        // bob must complete while alice is still gated (unrelated progress);
+        // poll instead of sleeping so the assertion is about progress.
+        let poll_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let bob_done = {
+                let completed = provider.completed.lock().unwrap_or_else(|e| e.into_inner());
+                completed.iter().any(|turn| {
+                    turn.iter()
+                        .any(|(role, content)| role == "user" && content.contains("hello"))
+                })
+            };
+            if bob_done {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < poll_deadline,
+                "unrelated scope starved behind a full backlog"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        release.notify_waiters();
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(2), loop_task)
+            .await
+            .expect("dispatch loop must drain all admitted messages")
+            .unwrap();
+
+        {
+            let calls = provider.calls.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                calls.len(),
+                4,
+                "first/second/third/hello must run; fourth/fifth must be rejected, got {} calls",
+                calls.len()
+            );
+            let completed = provider.completed.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                completed.len(),
+                4,
+                "four turns may complete, got {:?}",
+                *completed
+            );
+            for expected in ["first", "second", "third", "hello"] {
+                assert!(
+                    completed.iter().any(|turn| turn
+                        .iter()
+                        .any(|(role, content)| role == "user" && content.contains(expected))),
+                    "expected {:?} to run, got {:?}",
+                    expected,
+                    *completed
+                );
+            }
+            let all_content: Vec<String> = completed
+                .iter()
+                .flat_map(|turn| turn.iter().map(|(_, content)| content.clone()))
+                .collect();
+            assert!(
+                !all_content.iter().any(|c| c.contains("fourth"))
+                    && !all_content.iter().any(|c| c.contains("fifth")),
+                "overflowing messages must be dropped, got {:?}",
+                all_content
+            );
+        }
+        let peak = peak_in_flight.load(Ordering::SeqCst);
+        assert!(
+            peak >= 2,
+            "unrelated scope must run concurrently with the slow scope, got peak {}",
+            peak
+        );
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent_messages.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn message_dispatch_stop_bypasses_full_backlog() {
+        // /stop must bypass a full per-scope backlog: it cancels the active
+        // turn and drains the queued successors, and a message arriving after
+        // the stop runs in a fresh scope even though the queue was full.
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        let first_gated_call_started = Arc::new(tokio::sync::Notify::new());
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak_in_flight = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(GatedCallSequenceProvider {
+            classifier_gate: false,
+            gate_first_history_call: true,
+            release: release.clone(),
+            first_gated_call_started: first_gated_call_started.clone(),
+            calls: std::sync::Mutex::new(Vec::new()),
+            completed: std::sync::Mutex::new(Vec::new()),
+            classifier_calls: AtomicUsize::new(0),
+            history_calls: AtomicUsize::new(0),
+            in_flight: in_flight.clone(),
+            peak_in_flight: peak_in_flight.clone(),
+        });
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider.clone(),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(16);
+        let loop_task = ::zeroclaw_spawn::spawn!(run_message_dispatch_loop(
+            rx,
+            AgentRouter::single(runtime_ctx),
+            2
+        ));
+        for (id, content, ts) in [
+            ("1", "first", 1u64),
+            ("2", "second", 2),
+            ("3", "third", 3),
+            ("4", "fourth", 4),
+            ("5", "fifth", 5),
+        ] {
+            tx.send(zeroclaw_api::channel::ChannelMessage {
+                id: id.into(),
+                sender: "alice".into(),
+                reply_target: "chat-1".into(),
+                content: content.into(),
+                channel: "test-channel".into(),
+                timestamp: ts,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(2), first_gated_call_started.notified())
+            .await
+            .expect("first turn must gate in the provider");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        // /stop arrives while the queue is full (active + two queued, two
+        // rejected). It must cancel the whole scope, not be blocked by it.
+        tx.send(zeroclaw_api::channel::ChannelMessage {
+            id: "stop".into(),
+            sender: "alice".into(),
+            reply_target: "chat-1".into(),
+            content: "/stop".into(),
+            channel: "test-channel".into(),
+            timestamp: 6,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        // A fresh message after the stop runs in the recreated scope.
+        tx.send(zeroclaw_api::channel::ChannelMessage {
+            id: "7".into(),
+            sender: "alice".into(),
+            reply_target: "chat-1".into(),
+            content: "sixth".into(),
+            channel: "test-channel".into(),
+            timestamp: 7,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        // Ensure the gated active turn can be released either way (the stop
+        // cancels it; the release is a no-op if it already exited).
+        release.notify_waiters();
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(2), loop_task)
+            .await
+            .expect("dispatch loop must terminate after /stop")
+            .unwrap();
+
+        {
+            let calls = provider.calls.lock().unwrap_or_else(|e| e.into_inner());
+            // The pre-stop active turn already started its provider call and
+            // was cancelled mid-gate by /stop, so it must never complete; the
+            // post-stop turn is the only new provider call.
+            assert_eq!(
+                calls.len(),
+                2,
+                "gated turn started but must not complete; only the post-stop turn may be a new call, got {} calls",
+                calls.len()
+            );
+            let completed = provider.completed.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(completed.len(), 1, "only the post-stop turn may complete");
+            assert!(
+                completed[0]
+                    .iter()
+                    .any(|(role, content)| role == "user" && content.contains("sixth")),
+                "post-stop turn must run, got {:?}",
+                *completed
+            );
+        }
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(
+            sent_messages.len(),
+            2,
+            "response-2 (post-stop call) plus the stop-ack, got {:?}",
+            *sent_messages
+        );
+        assert!(
+            sent_messages.iter().any(|m| m.contains("response-2")),
+            "post-stop response must be delivered, got {:?}",
+            *sent_messages
+        );
+        assert!(
+            sent_messages
+                .iter()
+                .any(|m| m.starts_with("chat-1:") && !m.contains("response-")),
+            "stop-ack must be delivered to chat-1, got {:?}",
+            *sent_messages
         );
     }
 
