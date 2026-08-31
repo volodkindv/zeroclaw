@@ -24228,7 +24228,9 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
