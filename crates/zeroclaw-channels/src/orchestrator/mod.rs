@@ -586,13 +586,23 @@ fn acquire_persist_lock(ctx: &ChannelRuntimeContext, key: &str) -> Arc<std::sync
 #[derive(Clone)]
 struct InFlightSenderTaskState {
     task_id: u64,
+    /// The interruption scope (`interruption_scope_key`) of the message that
+    /// owns this task. The task is queued under its conversation-history key,
+    /// which a Matrix/Slack thread follow-up SHARES with its root while its
+    /// interruption scope is distinct; `/stop` and interrupt-on-new-message
+    /// therefore target tasks by this narrower scope, never by the whole
+    /// history queue.
+    interruption_scope: String,
     cancellation: CancellationToken,
     completion: Arc<InFlightTaskCompletion>,
 }
 
-/// Per-scope dispatch state: the currently executing turn plus any same-scope
-/// successors queued behind it. `/stop` can reach the active turn even while
-/// successors are waiting, and admission order (receiver order) is preserved.
+/// Per-conversation-history dispatch state: the currently executing turn plus
+/// any same-history successors queued behind it. A Matrix/Slack root and its
+/// thread follow-ups share one history and therefore one FIFO queue, so a
+/// follow-up can never snapshot the history before the root's result is saved.
+/// `/stop` reaches only the tasks whose interruption scope matches (thread-
+/// specific cancellation), and admission order (receiver order) is preserved.
 #[derive(Default)]
 struct InFlightScopeState {
     active: Option<InFlightSenderTaskState>,
@@ -7930,16 +7940,7 @@ async fn process_channel_message_body(
     }
 }
 
-/// Registers `state` in the scope's queue and returns the predecessor whose
-/// completion the caller must wait on, if any. Runs in the receiver task so
-/// admission order matches channel receive order (FIFO).
-///
-/// The predecessor is always the ACTIVE turn, never the tail of the waiting
-/// queue: with interrupt_on_new_message the new worker must cancel the running
-/// turn (a queued successor has nothing to cancel yet), and without it the new
-/// worker waits on the running turn — promotion through the queue is handled by
-/// the active worker alone (see `finish_active`).
-/// Result of admitting a message into the per-scope FIFO queue.
+/// Result of admitting a message into the per-history FIFO queue.
 enum RegisterOutcome {
     /// The message became the active turn (no predecessor to wait for).
     Active,
@@ -7947,19 +7948,31 @@ enum RegisterOutcome {
     /// must wait for (always `Some` at registration time — an entry with a
     /// waiting queue always has an active slot).
     Queued(Option<InFlightSenderTaskState>),
-    /// The per-scope backlog limit was reached; the message was rejected with
+    /// The per-history backlog limit was reached; the message was rejected with
     /// the explicit full-queue policy (drop + warning) and must not be spawned.
     QueueFull,
 }
 
+/// Registers `state` in the history session's queue and returns the
+/// predecessor whose completion the caller must wait on, if any. The map key
+/// is the conversation-history session identity, so a Matrix/Slack root and
+/// its thread follow-ups (which share one history but carry different
+/// interruption scopes) serialize in the same FIFO queue. Runs in the receiver
+/// task so admission order matches channel receive order (FIFO).
+///
+/// The predecessor is always the ACTIVE turn, never the tail of the waiting
+/// queue: with interrupt_on_new_message the new worker must cancel the running
+/// turn (a queued successor has nothing to cancel yet), and without it the new
+/// worker waits on the running turn — promotion through the queue is handled by
+/// the active worker alone (see `finish_active`).
 async fn register_in_flight(
     in_flight: &tokio::sync::Mutex<HashMap<String, InFlightScopeState>>,
-    scope_key: &str,
+    history_key: &str,
     state: InFlightSenderTaskState,
     backlog_limit: usize,
 ) -> RegisterOutcome {
     let mut map = in_flight.lock().await;
-    let scope = map.entry(scope_key.to_string()).or_default();
+    let scope = map.entry(history_key.to_string()).or_default();
     if scope.active.is_none() {
         scope.active = Some(state);
         RegisterOutcome::Active
@@ -8061,7 +8074,11 @@ async fn dispatch_worker(
     let interrupt_enabled = ctx
         .interrupt_on_new_message
         .enabled_for_channel(msg.channel.as_str());
-    let sender_scope_key = interruption_scope_key(&msg);
+    // Map key for this worker's queue slot: the runtime conversation-history
+    // session identity. A Matrix/Slack root and its thread follow-ups share one
+    // history key, so they serialize in one FIFO queue even though each carries
+    // its own interruption scope (see `interruption_scope_key`).
+    let history_key = runtime_conversation_history_key(ctx.as_ref(), &msg);
     let tracked = msg.channel != "cli" && !msg.passive_context;
 
     // Waiter loop: the predecessor is always the ACTIVE turn at registration
@@ -8075,7 +8092,15 @@ async fn dispatch_worker(
     let mut cancel_predecessor = true;
     loop {
         if let Some(previous) = wait_on.clone() {
-            if interrupt_enabled && cancel_predecessor {
+            // interrupt_on_new_message cancels only a predecessor running in
+            // the SAME interruption scope (the same thread, for a Matrix/Slack
+            // root vs. its follow-ups). A follow-up must never cancel the
+            // root's turn or another thread's turn of the same history — those
+            // are serialized behind it, not interrupted.
+            if interrupt_enabled
+                && cancel_predecessor
+                && previous.interruption_scope == state.interruption_scope
+            {
                 ::zeroclaw_log::record!(
                     INFO,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -8094,7 +8119,7 @@ async fn dispatch_worker(
             }
             // Cancellation point 1: may have been cancelled while waiting.
             if state.cancellation.is_cancelled() {
-                exit_tracked_state(&in_flight, &sender_scope_key, &state).await;
+                exit_tracked_state(&in_flight, &history_key, &state).await;
                 return;
             }
         }
@@ -8111,7 +8136,7 @@ async fn dispatch_worker(
         }
         let slot = {
             let mut map = in_flight.lock().await;
-            match map.get_mut(&sender_scope_key) {
+            match map.get_mut(&history_key) {
                 None => Slot::Gone,
                 Some(scope)
                     if scope
@@ -8136,7 +8161,7 @@ async fn dispatch_worker(
     // Cancellation points 2+3: nothing awaits between confirming we hold the
     // active slot and taking the permit, so one check covers both windows.
     if state.cancellation.is_cancelled() {
-        exit_tracked_state(&in_flight, &sender_scope_key, &state).await;
+        exit_tracked_state(&in_flight, &history_key, &state).await;
         return;
     }
     // The global permit is taken only now, after promotion: waiting and
@@ -8156,7 +8181,7 @@ async fn dispatch_worker(
             }
         },
         _ = state.cancellation.cancelled() => {
-            exit_tracked_state(&in_flight, &sender_scope_key, &state).await;
+            exit_tracked_state(&in_flight, &history_key, &state).await;
             return;
         }
     };
@@ -8164,7 +8189,7 @@ async fn dispatch_worker(
     if tracked {
         // Hand the slot to the next waiter (or drop the entry) BEFORE marking
         // done, so a successor woken by `mark_done` already sees the promotion.
-        finish_active(&in_flight, &sender_scope_key, state.task_id).await;
+        finish_active(&in_flight, &history_key, state.task_id).await;
     }
     state.completion.mark_done();
 }
@@ -8751,24 +8776,43 @@ async fn run_message_dispatch_loop(
         if dispatch_channel_sop_event(&router, &msg).await {
             continue;
         }
-        // Fast path: /stop cancels the in-flight task for this sender scope without
-        // spawning a worker or registering a new task. Handled here — before semaphore
-        // acquisition — so the target task is still in the store and is never replaced.
+        // Fast path: /stop cancels the in-flight task(s) for this interruption
+        // scope without spawning a worker or registering a new task. Handled
+        // here — before semaphore acquisition — so the target task is still in
+        // the store and is never replaced. The history key locates the FIFO
+        // queue (a Matrix/Slack root and its thread follow-ups share it); the
+        // interruption scope then selects which tasks inside that queue belong
+        // to this thread and must be cancelled. Thread-specific targeting is
+        // preserved: /stop in a thread cancels that thread's tasks without
+        // touching the root turn or another thread's turn of the same history.
         if msg.channel != "cli" && is_stop_command(&msg.content) {
-            let scope_key = interruption_scope_key(&msg);
-            let removed = {
-                let mut active = in_flight_by_sender.lock().await;
-                active.remove(&scope_key)
-            };
+            let history_key = runtime_conversation_history_key(ctx.as_ref(), &msg);
+            let stop_scope = interruption_scope_key(&msg);
             let mut any_task = false;
-            if let Some(scope) = removed {
-                if let Some(state) = scope.active {
-                    state.cancellation.cancel();
-                    any_task = true;
-                }
-                for state in scope.waiting {
-                    state.cancellation.cancel();
-                    any_task = true;
+            {
+                let mut in_flight = in_flight_by_sender.lock().await;
+                if let Some(scope) = in_flight.get_mut(&history_key) {
+                    if let Some(state) = scope.active.as_ref()
+                        && state.interruption_scope == stop_scope
+                    {
+                        state.cancellation.cancel();
+                        any_task = true;
+                    }
+                    // Only same-scope waiters are cancelled; the active worker
+                    // performs the structural cleanup and promotes the next
+                    // waiter itself (see `finish_active`/`exit_tracked_state`).
+                    scope.waiting.retain(|state| {
+                        if state.interruption_scope == stop_scope {
+                            state.cancellation.cancel();
+                            any_task = true;
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    if scope.active.is_none() && scope.waiting.is_empty() {
+                        in_flight.remove(&history_key);
+                    }
                 }
             }
             let reply = if any_task {
@@ -8840,6 +8884,7 @@ async fn run_message_dispatch_loop(
                         let completion = Arc::new(InFlightTaskCompletion::new());
                         let state = InFlightSenderTaskState {
                             task_id,
+                            interruption_scope: interruption_scope_key(&debounce_msg),
                             cancellation: cancellation_token,
                             completion: Arc::clone(&completion),
                         };
@@ -8848,7 +8893,10 @@ async fn run_message_dispatch_loop(
                         {
                             match register_in_flight(
                                 &debounce_in_flight,
-                                &interruption_scope_key(&debounce_msg),
+                                &runtime_conversation_history_key(
+                                    debounce_ctx.as_ref(),
+                                    &debounce_msg,
+                                ),
                                 state.clone(),
                                 debounce_backlog_limit,
                             )
@@ -8903,19 +8951,21 @@ async fn run_message_dispatch_loop(
         let completion = Arc::new(InFlightTaskCompletion::new());
         let state = InFlightSenderTaskState {
             task_id,
+            interruption_scope: interruption_scope_key(&msg),
             cancellation: cancellation_token,
             completion: Arc::clone(&completion),
         };
         let predecessor = if msg.channel != "cli" && !msg.passive_context {
             match register_in_flight(
                 &in_flight_by_sender,
-                &interruption_scope_key(&msg),
+                &runtime_conversation_history_key(ctx.as_ref(), &msg),
                 state.clone(),
-                // The per-scope backlog is capped by the same global budget:
-                // one slow scope may hold at most `max_in_flight_messages`
-                // queued turns (plus its active turn), so a flood behind it
-                // cannot grow memory without the configured bound. When the
-                // queue is full the message is rejected (explicit policy).
+                // The per-history backlog is capped by the same global budget:
+                // one slow history session (a root plus its thread follow-ups)
+                // may hold at most `max_in_flight_messages` queued turns (plus
+                // its active turn), so a flood behind it cannot grow memory
+                // without the configured bound. When the queue is full the
+                // message is rejected (explicit policy).
                 max_in_flight_messages,
             )
             .await
@@ -17455,6 +17505,52 @@ api_key = "anthropic-key"
         }
     }
 
+    #[derive(Default)]
+    struct MatrixRecordingChannel {
+        sent_messages: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for MatrixRecordingChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for MatrixRecordingChannel {
+        fn name(&self) -> &str {
+            "matrix"
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent_messages
+                .lock()
+                .await
+                .push(format!("{}:{}", message.recipient, message.content));
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
     impl ::zeroclaw_api::attribution::Attributable for WhatsAppRecordingChannel {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
             ::zeroclaw_api::attribution::Role::Channel(
@@ -23846,6 +23942,43 @@ BTC is currently around $65,000 based on latest tool output."#
         .unwrap();
         // Give the cancellation branch time to run while alice is still gated.
         tokio::time::sleep(Duration::from_millis(40)).await;
+        // A second /stop for bob must now report "no task": the cancelled
+        // worker left the in-flight store while alice still holds the only
+        // permit. An uncancellable permit waiter would still occupy bob's
+        // scope and would answer "Stop signal sent" instead.
+        tx.send(zeroclaw_api::channel::ChannelMessage {
+            id: "4".into(),
+            sender: "bob".into(),
+            reply_target: "chat-2".into(),
+            content: "/stop".into(),
+            channel: "test-channel".into(),
+            timestamp: 4,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let sent = channel_impl.sent_messages.lock().await;
+                let stop_acks = sent.iter().filter(|m| m.starts_with("chat-2:")).count();
+                if stop_acks >= 2 {
+                    return;
+                }
+                drop(sent);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second stop-ack must arrive while alice is still gated");
+        {
+            let sent = channel_impl.sent_messages.lock().await;
+            assert!(
+                sent.iter()
+                    .any(|m| m.starts_with("chat-2:") && m.contains("No in-flight task")),
+                "bob's scope must be released by cancellation while the permit is still held, got {:?}",
+                *sent
+            );
+        }
         // Now release the unrelated permit. If bob were still parked on
         // `acquire_owned` it would acquire the freed permit and run; with the
         // fix it already exited and never touches the provider.
@@ -23878,8 +24011,8 @@ BTC is currently around $65,000 based on latest tool output."#
         let sent_messages = channel_impl.sent_messages.lock().await;
         assert_eq!(
             sent_messages.len(),
-            2,
-            "response-1 plus the stop-ack, got {:?}",
+            3,
+            "response-1 plus the two stop-acks, got {:?}",
             *sent_messages
         );
         assert!(
@@ -23889,7 +24022,7 @@ BTC is currently around $65,000 based on latest tool output."#
         );
         assert!(
             sent_messages.iter().any(|m| m.starts_with("chat-2:")),
-            "stop-ack must be addressed to bob's chat, got {:?}",
+            "stop-acks must be addressed to bob's chat, got {:?}",
             *sent_messages
         );
     }
@@ -34522,6 +34655,400 @@ This is an example JSON object for profile settings."#;
             2,
             "both Slack thread messages should complete, got: {sent_messages:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn message_dispatch_serializes_matrix_root_and_thread_followup() {
+        // Blocker regression (#10408): a Matrix thread follow-up shares its
+        // root's conversation history but carries its own interruption scope.
+        // Keying the dispatch queue by interruption scope therefore let the
+        // root and its follow-up run concurrently, and the follow-up could
+        // snapshot history before the root's result was saved. Serialization
+        // must key by the history session: hold the root in the provider,
+        // admit the follow-up, and assert that the follow-up's provider call
+        // waits and then includes the root turn's saved result.
+        let channel_impl = Arc::new(MatrixRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        let first_gated_call_started = Arc::new(tokio::sync::Notify::new());
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak_in_flight = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(GatedCallSequenceProvider {
+            classifier_gate: false,
+            gate_first_history_call: true,
+            release: release.clone(),
+            first_gated_call_started: first_gated_call_started.clone(),
+            calls: std::sync::Mutex::new(Vec::new()),
+            completed: std::sync::Mutex::new(Vec::new()),
+            classifier_calls: AtomicUsize::new(0),
+            history_calls: AtomicUsize::new(0),
+            in_flight: in_flight.clone(),
+            peak_in_flight: peak_in_flight.clone(),
+        });
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider.clone(),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let loop_task = ::zeroclaw_spawn::spawn!(run_message_dispatch_loop(
+            rx,
+            AgentRouter::single(runtime_ctx),
+            2
+        ));
+        // Root message: plain room message (no thread anchor, no scope id).
+        tx.send(zeroclaw_api::channel::ChannelMessage {
+            id: "$root1".into(),
+            sender: "alice".into(),
+            reply_target: "!room:example.org".into(),
+            content: "root question".into(),
+            channel: "matrix".into(),
+            channel_alias: None,
+            timestamp: 1,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+            subject: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), first_gated_call_started.notified())
+            .await
+            .expect("root turn must gate in the provider");
+        // Thread follow-up: same room+sender history, own interruption scope.
+        tx.send(zeroclaw_api::channel::ChannelMessage {
+            id: "$follow1".into(),
+            sender: "alice".into(),
+            reply_target: "!room:example.org".into(),
+            content: "follow-up in thread".into(),
+            channel: "matrix".into(),
+            channel_alias: None,
+            timestamp: 2,
+            thread_ts: Some("$root1".into()),
+            interruption_scope_id: Some("$root1".into()),
+            attachments: vec![],
+            subject: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        // The follow-up must NOT enter the provider while the root is gated.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        {
+            let calls = provider.calls.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                calls.len(),
+                1,
+                "follow-up must wait for the root turn instead of running concurrently, got {} provider calls",
+                calls.len()
+            );
+        }
+        assert_eq!(
+            peak_in_flight.load(Ordering::SeqCst),
+            1,
+            "root and thread follow-up share one history session and must serialize"
+        );
+        release.notify_waiters();
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(2), loop_task)
+            .await
+            .expect("dispatch loop must finish after both turns")
+            .unwrap();
+
+        {
+            let calls = provider.calls.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(calls.len(), 2, "both turns must run, in order");
+            let second = &calls[1];
+            assert!(
+                second.iter().any(
+                    |(role, content)| role == "user" && content.contains("follow-up in thread")
+                ),
+                "follow-up call must carry its own message, got {:?}",
+                *second
+            );
+            assert!(
+                second.iter().any(|(role, content)| {
+                    role == "assistant" && content.contains("response-1")
+                }),
+                "follow-up call must include the root turn's saved result, got {:?}",
+                *second
+            );
+        }
+        assert_eq!(
+            in_flight.load(Ordering::SeqCst),
+            0,
+            "no provider call may linger"
+        );
+    }
+
+    #[tokio::test]
+    async fn message_dispatch_serializes_slack_root_and_thread_followup() {
+        // Same blocker regression as the Matrix variant, shaped like the Slack
+        // adapter: the root carries its own timestamp as the history thread
+        // anchor (thread_ts == its own ts) but no interruption-scope id, while
+        // the follow-up carries that timestamp as its interruption-scope id.
+        // Different interruption scopes, one shared history — must serialize.
+        let channel_impl = Arc::new(SlackRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        let first_gated_call_started = Arc::new(tokio::sync::Notify::new());
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak_in_flight = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(GatedCallSequenceProvider {
+            classifier_gate: false,
+            gate_first_history_call: true,
+            release: release.clone(),
+            first_gated_call_started: first_gated_call_started.clone(),
+            calls: std::sync::Mutex::new(Vec::new()),
+            completed: std::sync::Mutex::new(Vec::new()),
+            classifier_calls: AtomicUsize::new(0),
+            history_calls: AtomicUsize::new(0),
+            in_flight: in_flight.clone(),
+            peak_in_flight: peak_in_flight.clone(),
+        });
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider.clone(),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let loop_task = ::zeroclaw_spawn::spawn!(run_message_dispatch_loop(
+            rx,
+            AgentRouter::single(runtime_ctx),
+            2
+        ));
+        // Root message of the thread: its own ts is the history anchor.
+        tx.send(zeroclaw_api::channel::ChannelMessage {
+            id: "1741234567.100001".into(),
+            sender: "alice".into(),
+            reply_target: "C123".into(),
+            content: "root question".into(),
+            channel: "slack".into(),
+            channel_alias: None,
+            timestamp: 1,
+            thread_ts: Some("1741234567.100001".into()),
+            interruption_scope_id: None,
+            attachments: vec![],
+            subject: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), first_gated_call_started.notified())
+            .await
+            .expect("root turn must gate in the provider");
+        // Follow-up in the same thread: same history, distinct scope id.
+        tx.send(zeroclaw_api::channel::ChannelMessage {
+            id: "1741234567.200002".into(),
+            sender: "alice".into(),
+            reply_target: "C123".into(),
+            content: "follow-up in thread".into(),
+            channel: "slack".into(),
+            channel_alias: None,
+            timestamp: 2,
+            thread_ts: Some("1741234567.100001".into()),
+            interruption_scope_id: Some("1741234567.100001".into()),
+            attachments: vec![],
+            subject: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        // The follow-up must NOT enter the provider while the root is gated.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        {
+            let calls = provider.calls.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                calls.len(),
+                1,
+                "follow-up must wait for the root turn instead of running concurrently, got {} provider calls",
+                calls.len()
+            );
+        }
+        assert_eq!(
+            peak_in_flight.load(Ordering::SeqCst),
+            1,
+            "root and thread follow-up share one history session and must serialize"
+        );
+        release.notify_waiters();
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(2), loop_task)
+            .await
+            .expect("dispatch loop must finish after both turns")
+            .unwrap();
+
+        {
+            let calls = provider.calls.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(calls.len(), 2, "both turns must run, in order");
+            let second = &calls[1];
+            assert!(
+                second.iter().any(
+                    |(role, content)| role == "user" && content.contains("follow-up in thread")
+                ),
+                "follow-up call must carry its own message, got {:?}",
+                *second
+            );
+            assert!(
+                second.iter().any(|(role, content)| {
+                    role == "assistant" && content.contains("response-1")
+                }),
+                "follow-up call must include the root turn's saved result, got {:?}",
+                *second
+            );
+        }
+        assert_eq!(
+            in_flight.load(Ordering::SeqCst),
+            0,
+            "no provider call may linger"
+        );
+    }
+
+    #[tokio::test]
+    async fn message_dispatch_thread_stop_cancels_followup_not_root_of_same_history() {
+        // Thread-specific /stop must be preserved now that the dispatch queue
+        // is keyed by history: a root and its follow-up share one queue, but
+        // /stop written in the thread must cancel the follow-up's waiting turn
+        // while the root's gated turn keeps running to completion.
+        let channel_impl = Arc::new(SlackRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        let first_gated_call_started = Arc::new(tokio::sync::Notify::new());
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak_in_flight = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(GatedCallSequenceProvider {
+            classifier_gate: false,
+            gate_first_history_call: true,
+            release: release.clone(),
+            first_gated_call_started: first_gated_call_started.clone(),
+            calls: std::sync::Mutex::new(Vec::new()),
+            completed: std::sync::Mutex::new(Vec::new()),
+            classifier_calls: AtomicUsize::new(0),
+            history_calls: AtomicUsize::new(0),
+            in_flight: in_flight.clone(),
+            peak_in_flight: peak_in_flight.clone(),
+        });
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider.clone(),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let loop_task = ::zeroclaw_spawn::spawn!(run_message_dispatch_loop(
+            rx,
+            AgentRouter::single(runtime_ctx),
+            2
+        ));
+        tx.send(zeroclaw_api::channel::ChannelMessage {
+            id: "1741234567.100001".into(),
+            sender: "alice".into(),
+            reply_target: "C123".into(),
+            content: "root question".into(),
+            channel: "slack".into(),
+            channel_alias: None,
+            timestamp: 1,
+            thread_ts: Some("1741234567.100001".into()),
+            interruption_scope_id: None,
+            attachments: vec![],
+            subject: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), first_gated_call_started.notified())
+            .await
+            .expect("root turn must gate in the provider");
+        // Follow-up in the same thread queues behind the root.
+        tx.send(zeroclaw_api::channel::ChannelMessage {
+            id: "1741234567.200002".into(),
+            sender: "alice".into(),
+            reply_target: "C123".into(),
+            content: "follow-up in thread".into(),
+            channel: "slack".into(),
+            channel_alias: None,
+            timestamp: 2,
+            thread_ts: Some("1741234567.100001".into()),
+            interruption_scope_id: Some("1741234567.100001".into()),
+            attachments: vec![],
+            subject: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        // /stop written inside the thread: targets the follow-up's scope only.
+        tx.send(zeroclaw_api::channel::ChannelMessage {
+            id: "1741234567.300003".into(),
+            sender: "alice".into(),
+            reply_target: "C123".into(),
+            content: "/stop".into(),
+            channel: "slack".into(),
+            channel_alias: None,
+            timestamp: 3,
+            thread_ts: Some("1741234567.100001".into()),
+            interruption_scope_id: Some("1741234567.100001".into()),
+            attachments: vec![],
+            subject: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        // While the root is still gated, its turn must keep running untouched.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(
+            in_flight.load(Ordering::SeqCst),
+            1,
+            "root turn must still be in flight after a thread-scoped /stop"
+        );
+        {
+            let calls = provider.calls.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(calls.len(), 1, "follow-up must be cancelled, never started");
+        }
+        release.notify_waiters();
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(2), loop_task)
+            .await
+            .expect("dispatch loop must finish after the root turn")
+            .unwrap();
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert!(
+            sent_messages.iter().any(|m| m.contains("response-1")),
+            "root turn's response must be delivered, got {:?}",
+            *sent_messages
+        );
+        assert!(
+            sent_messages.iter().any(|m| m.contains("Stop signal sent")),
+            "thread /stop must be acknowledged, got {:?}",
+            *sent_messages
+        );
+        assert!(
+            !sent_messages.iter().any(|m| m.contains("response-2")),
+            "cancelled follow-up must never run, got {:?}",
+            *sent_messages
+        );
+        {
+            let completed = provider.completed.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(completed.len(), 1, "only the root turn may complete");
+        }
     }
 
     #[test]
