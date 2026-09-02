@@ -8002,17 +8002,17 @@ async fn register_in_flight(
 /// silently dropped with it.
 async fn finish_active(
     in_flight: &tokio::sync::Mutex<HashMap<String, InFlightScopeState>>,
-    scope_key: &str,
+    history_key: &str,
     task_id: u64,
 ) {
     let mut map = in_flight.lock().await;
-    if let Some(scope) = map.get_mut(scope_key)
+    if let Some(scope) = map.get_mut(history_key)
         && scope.active.as_ref().is_some_and(|a| a.task_id == task_id)
     {
         match scope.waiting.pop_front() {
             Some(next) => scope.active = Some(next),
             None => {
-                map.remove(scope_key);
+                map.remove(history_key);
             }
         }
     }
@@ -8031,11 +8031,11 @@ async fn finish_active(
 /// land in a record that is then deleted out from under it.
 async fn exit_tracked_state(
     in_flight: &tokio::sync::Mutex<HashMap<String, InFlightScopeState>>,
-    scope_key: &str,
+    history_key: &str,
     state: &InFlightSenderTaskState,
 ) {
     let mut map = in_flight.lock().await;
-    if let Some(scope) = map.get_mut(scope_key) {
+    if let Some(scope) = map.get_mut(history_key) {
         if scope
             .active
             .as_ref()
@@ -8047,7 +8047,7 @@ async fn exit_tracked_state(
             match scope.waiting.pop_front() {
                 Some(next) => scope.active = Some(next),
                 None => {
-                    map.remove(scope_key);
+                    map.remove(history_key);
                     state.completion.mark_done();
                     return;
                 }
@@ -8055,7 +8055,7 @@ async fn exit_tracked_state(
         }
         scope.waiting.retain(|s| s.task_id != state.task_id);
         if scope.active.is_none() && scope.waiting.is_empty() {
-            map.remove(scope_key);
+            map.remove(history_key);
         }
     }
     state.completion.mark_done();
@@ -8865,7 +8865,7 @@ async fn run_message_dispatch_loop(
                     let debounce_in_flight = Arc::clone(&in_flight_by_sender);
                     let debounce_task_seq = Arc::clone(&task_sequence);
                     let debounce_semaphore = Arc::clone(&semaphore);
-                    // Same per-scope backlog bound as the normal path.
+                    // Same per-history backlog bound as the normal path.
                     let debounce_backlog_limit = max_in_flight_messages;
                     let mut debounce_msg = msg;
                     workers.spawn(async move {
@@ -8910,7 +8910,7 @@ async fn run_message_dispatch_loop(
                                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                                             .with_attrs(::serde_json::json!({"channel": debounce_msg.channel, "sender": debounce_msg.sender})),
-                                        "dropping debounced channel message: per-scope queue is full"
+                                        "dropping debounced channel message: per-history queue is full"
                                     );
                                     return;
                                 }
@@ -8944,7 +8944,7 @@ async fn run_message_dispatch_loop(
             msg
         };
 
-        // Admission happens here, in the receiver task, so same-scope turns are
+        // Admission happens here, in the receiver task, so same-history turns are
         // queued in channel receive order (FIFO) before any worker may register.
         let task_id = task_sequence.fetch_add(1, Ordering::Relaxed);
         let cancellation_token = CancellationToken::new();
@@ -8980,7 +8980,7 @@ async fn run_message_dispatch_loop(
                             .with_attrs(
                                 ::serde_json::json!({"channel": msg.channel, "sender": msg.sender})
                             ),
-                        "dropping channel message: per-scope queue is full"
+                        "dropping channel message: per-history queue is full"
                     );
                     continue;
                 }
@@ -24029,7 +24029,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
     #[tokio::test]
     async fn message_dispatch_scope_backlog_bounded_and_other_scopes_progress() {
-        // Blocker-2 regression: per-scope backlog is bounded, so a flood behind
+        // Blocker-2 regression: per-history backlog is bounded, so a flood behind
         // one slow scope is rejected (explicit drop policy) instead of growing
         // the queue without limit, while unrelated scopes keep making progress.
         let channel_impl = Arc::new(RecordingChannel::default());
@@ -24062,7 +24062,7 @@ BTC is currently around $65,000 based on latest tool output."#
         );
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(16);
-        // max_in_flight = 2 doubles as the per-scope backlog limit: alice may
+        // max_in_flight = 2 doubles as the per-history backlog limit: alice may
         // hold one active turn plus two queued; "fourth"/"fifth" must be
         // rejected while bob (unrelated scope) still runs concurrently.
         let loop_task = ::zeroclaw_spawn::spawn!(run_message_dispatch_loop(
@@ -24179,7 +24179,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
     #[tokio::test]
     async fn message_dispatch_stop_bypasses_full_backlog() {
-        // /stop must bypass a full per-scope backlog: it cancels the active
+        // /stop must bypass a full per-history backlog: it cancels the active
         // turn and drains the queued successors, and a message arriving after
         // the stop runs in a fresh scope even though the queue was full.
         let channel_impl = Arc::new(RecordingChannel::default());
