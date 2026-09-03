@@ -34659,7 +34659,7 @@ This is an example JSON object for profile settings."#;
 
     #[tokio::test]
     async fn message_dispatch_serializes_matrix_root_and_thread_followup() {
-        // Blocker regression (#10408): a Matrix thread follow-up shares its
+        // A Matrix thread follow-up shares its
         // root's conversation history but carries its own interruption scope.
         // Keying the dispatch queue by interruption scope therefore let the
         // root and its follow-up run concurrently, and the follow-up could
