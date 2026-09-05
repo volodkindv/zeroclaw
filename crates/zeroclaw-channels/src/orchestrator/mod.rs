@@ -8086,28 +8086,37 @@ async fn dispatch_worker(
     // queue (e.g. a Slack top-level message keys its history by its own
     // timestamp and carries no interruption-scope id) has no same-history
     // predecessor — yet with interrupt enabled it must still cancel the
-    // sender's ACTIVE turn running in another history queue that shares its
-    // interruption scope. Locate that running turn independently of the
-    // history key and await its exit exactly like a same-history predecessor
-    // in the waiter loop below.
+    // sender's ACTIVE turn(s) running in other history queues that share its
+    // interruption scope. Locate those running turns independently of the
+    // history key and await their exit before starting, exactly like a
+    // same-history predecessor is awaited in the waiter loop below.
     //
     // Only OLDER tasks (lower `task_id` from the monotonic task sequence) are
     // cancelled: a newer foreign turn is a successor that will cancel us in
     // its own worker, so touching it would create a mutual-cancellation race
     // in which two near-simultaneous same-scope messages (a Slack top-level
-    // burst) cancel each other and are both dropped. The NEWEST of the older
-    // active turns is the one awaited — it is the one most likely still
-    // running, and it is itself waiting on (or will cancel) any even older
-    // active turn. Older same-scope QUEUED tasks in other histories are
-    // detached and cancelled too, so a cancelled active cannot promote one of
-    // them into a run parallel to ours.
+    // burst) cancel each other and are both dropped.
+    //
+    // Every older ACTIVE turn found in another history queue is cancelled AND
+    // awaited before we may start. Waiting only for the NEWEST one is not
+    // enough: that turn may itself be waiting on an even older active turn (B
+    // serialized behind A), and when it exits on its own cancellation it would
+    // wake us before the older turn (A) has finished — A can still be inside
+    // cancellation-insensitive preprocessing (hooks, SOP dispatch, provider
+    // setup, autosave) doing durable or visible work. Awaiting every matched
+    // older active completion restores the no-overlap / latest-turn guarantee
+    // of `interrupt_on_new_message` transitively.
+    //
+    // Older same-scope QUEUED tasks in other histories are detached and
+    // cancelled too, so a cancelled active cannot promote one of them into a
+    // run parallel to ours.
     let mut wait_on = predecessor;
     if interrupt_enabled && tracked && wait_on.is_none() {
         let scope = state.interruption_scope.clone();
         let my_task_id = state.task_id;
-        let foreign_latest = {
+        let foreign_wait: Vec<InFlightSenderTaskState> = {
             let mut map = in_flight.lock().await;
-            let mut latest: Option<InFlightSenderTaskState> = None;
+            let mut cancelled: Vec<InFlightSenderTaskState> = Vec::new();
             let mut emptied: Vec<String> = Vec::new();
             for (key, entry) in map.iter_mut() {
                 if key == &history_key {
@@ -8118,9 +8127,7 @@ async fn dispatch_worker(
                     && active.task_id < my_task_id
                 {
                     active.cancellation.cancel();
-                    if latest.as_ref().is_none_or(|l| active.task_id > l.task_id) {
-                        latest = Some(active.clone());
-                    }
+                    cancelled.push(active.clone());
                 }
                 let (keep, removed): (Vec<_>, Vec<_>) = std::mem::take(&mut entry.waiting)
                     .into_iter()
@@ -8136,10 +8143,39 @@ async fn dispatch_worker(
             for key in emptied {
                 map.remove(&key);
             }
-            latest
+            cancelled
         };
-        if let Some(foreign_latest) = foreign_latest {
-            wait_on = Some(foreign_latest);
+        if !foreign_wait.is_empty() {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(
+                        ::serde_json::json!({"sender": msg.sender, "cancelled": foreign_wait.len()})
+                    ),
+                "interrupting previous in-flight requests for sender"
+            );
+            // Wait for EVERY cancelled older active turn to exit, not just the
+            // newest. Each cancelled turn is guaranteed to reach its tool-loop
+            // cancellation select and exit; `InFlightTaskCompletion` supports
+            // multiple concurrent waiters (AtomicBool + Notify::notify_waiters),
+            // and our own cancellation (/stop or an even newer successor) still
+            // wakes us immediately instead of sleeping through the wait.
+            let wait_foreign = async {
+                for turn in &foreign_wait {
+                    turn.completion.wait().await;
+                }
+            };
+            tokio::pin!(wait_foreign);
+            tokio::select! {
+                _ = &mut wait_foreign => {}
+                _ = state.cancellation.cancelled() => {}
+            }
+            // Cancellation point 1b: may have been cancelled while waiting for
+            // the interrupted foreign turns to exit.
+            if state.cancellation.is_cancelled() {
+                exit_tracked_state(&in_flight, &history_key, &state).await;
+                return;
+            }
         }
     }
     let mut cancel_predecessor = true;
@@ -8908,6 +8944,16 @@ async fn run_message_dispatch_loop(
             continue;
         }
 
+        // The ordering token is captured at receiver admission — before any
+        // debounce window runs — so task_id order always matches inbound
+        // order. (The debounce branch must not assign it after its independent
+        // history timer completes: a sender's top-level messages use separate
+        // history keys, so timer completion order can differ from receive
+        // order, and the cross-history interrupt logic treats task_id as the
+        // older/newer relation — a later-assigned id would let an earlier
+        // inbound message cancel the actual latest one.)
+        let task_id = task_sequence.fetch_add(1, Ordering::Relaxed);
+
         // ── Debounce: accumulate rapid messages per sender ──────────
         // CLI messages bypass debouncing so the interactive loop stays responsive.
         let msg = if msg.channel != "cli" {
@@ -8934,7 +8980,6 @@ async fn run_message_dispatch_loop(
                     // worker path below.
                     let debounce_ctx = Arc::clone(&ctx);
                     let debounce_in_flight = Arc::clone(&in_flight_by_sender);
-                    let debounce_task_seq = Arc::clone(&task_sequence);
                     let debounce_semaphore = Arc::clone(&semaphore);
                     // Same per-history backlog bound as the normal path.
                     let debounce_backlog_limit = max_in_flight_messages;
@@ -8950,7 +8995,10 @@ async fn run_message_dispatch_loop(
                         debounce_msg.content = combined;
                         ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"channel": debounce_msg.channel, "sender": debounce_msg.sender})), "Debounced message ready — dispatching combined message");
 
-                        let task_id = debounce_task_seq.fetch_add(1, Ordering::Relaxed);
+                        // task_id was captured at receiver admission (before the
+                        // debounce window ran) so this debounced turn keeps its
+                        // inbound order position in the cross-history interrupt
+                        // logic; a superseded task never reaches this point.
                         let cancellation_token = CancellationToken::new();
                         let completion = Arc::new(InFlightTaskCompletion::new());
                         let state = InFlightSenderTaskState {
@@ -9017,7 +9065,9 @@ async fn run_message_dispatch_loop(
 
         // Admission happens here, in the receiver task, so same-history turns are
         // queued in channel receive order (FIFO) before any worker may register.
-        let task_id = task_sequence.fetch_add(1, Ordering::Relaxed);
+        // (The task_id itself was already captured above, before the debounce
+        // branch, so debounced and non-debounced turns share one inbound-ordered
+        // sequence.)
         let cancellation_token = CancellationToken::new();
         let completion = Arc::new(InFlightTaskCompletion::new());
         let state = InFlightSenderTaskState {
@@ -35540,6 +35590,279 @@ This is an example JSON object for profile settings."#;
         assert!(
             sent_messages.iter().any(|m| m.contains("response-2")),
             "newest turn's response must be delivered, got {:?}",
+            *sent_messages
+        );
+    }
+
+    #[tokio::test]
+    async fn message_dispatch_slack_top_level_three_turn_burst_waits_for_every_cancelled_older_turn()
+     {
+        // Cascading-interrupt regression: THREE top-level Slack messages from
+        // one sender arrive as a burst; each opens its own history queue (fresh
+        // timestamp, no interruption-scope id). The first turn (A) is pinned in
+        // the reply-intent precheck -- a cancellation-INSENSITIVE phase that
+        // ignores cancellation -- and the second turn (B) is cancelled while it
+        // is itself waiting for A. The third turn (C) must cancel and await
+        // BOTH older active turns before starting processing. Waiting only for
+        // the NEWEST cancelled turn (B) is not enough: B exits promptly on its
+        // own cancellation (it is only a waiter), which would wake C while A is
+        // still doing cancellation-insensitive work -- breaking no-overlap.
+        // Every matched older active completion must be awaited transitively.
+        let channel_impl = Arc::new(SlackRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        let first_gated_call_started = Arc::new(tokio::sync::Notify::new());
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak_in_flight = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(GatedCallSequenceProvider {
+            // A is pinned in the classifier precheck (chat_with_system), which
+            // runs before the agent loop and ignores cancellation -- the
+            // cancellation-insensitive window the cascade bug hides in.
+            classifier_gate: true,
+            gate_first_history_call: false,
+            release: release.clone(),
+            first_gated_call_started: first_gated_call_started.clone(),
+            calls: std::sync::Mutex::new(Vec::new()),
+            completed: std::sync::Mutex::new(Vec::new()),
+            classifier_calls: AtomicUsize::new(0),
+            history_calls: AtomicUsize::new(0),
+            in_flight: in_flight.clone(),
+            peak_in_flight: peak_in_flight.clone(),
+        });
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider.clone(),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let mut ctx = (*runtime_ctx).clone();
+        ctx.interrupt_on_new_message.slack = true;
+        let runtime_ctx = Arc::new(ctx);
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let loop_task = ::zeroclaw_spawn::spawn!(run_message_dispatch_loop(
+            rx,
+            AgentRouter::single(runtime_ctx),
+            2
+        ));
+        let top_level = |id: &str, content: &str| zeroclaw_api::channel::ChannelMessage {
+            id: id.into(),
+            sender: "alice".into(),
+            reply_target: "C123".into(),
+            content: content.into(),
+            channel: "slack".into(),
+            channel_alias: None,
+            timestamp: 1,
+            thread_ts: Some(id.into()),
+            interruption_scope_id: None,
+            attachments: vec![],
+            subject: None,
+            ..Default::default()
+        };
+        // Burst: all three sit in the channel before the dispatch loop yields,
+        // so each registers as the active slot of its own history queue before
+        // any worker performs the cross-history lookup.
+        tx.send(top_level("1741234567.100001", "first question"))
+            .await
+            .unwrap();
+        tx.send(top_level("1741234567.200002", "second question"))
+            .await
+            .unwrap();
+        tx.send(top_level("1741234567.300003", "third question"))
+            .await
+            .unwrap();
+        // A reaches the classifier precheck and is held on the gate.
+        tokio::time::timeout(Duration::from_secs(2), first_gated_call_started.notified())
+            .await
+            .expect("first turn must reach the classifier precheck gate");
+        // Give B and C time to register, cancel the older turns and settle into
+        // their wait for the cancelled older completions.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        {
+            let completed = provider.completed.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                completed.is_empty(),
+                "no turn may complete while the first is still pinned in the precheck, got {completed:?}"
+            );
+        }
+        assert_eq!(
+            provider.history_calls.load(Ordering::SeqCst),
+            0,
+            "no turn may reach the agent loop while the first is still pinned in the precheck"
+        );
+        assert_eq!(
+            provider.classifier_calls.load(Ordering::SeqCst),
+            1,
+            "exactly the first turn may enter the (cancellation-insensitive) precheck; \
+             a later turn entering processing before the first exits is the cascade bug"
+        );
+        // Release A: it is cancelled, so its agent loop aborts; only then may C
+        // start and run to completion.
+        release.notify_waiters();
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(2), loop_task)
+            .await
+            .expect("dispatch loop must finish after the cascaded interrupt")
+            .unwrap();
+
+        {
+            let completed = provider.completed.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                !completed.is_empty(),
+                "the newest turn must run to completion, got {completed:?}"
+            );
+            let last = completed.last().expect("non-empty by the assert above");
+            assert!(
+                last.iter()
+                    .any(|(role, content)| role == "user" && content.contains("third question")),
+                "the NEWEST turn must be the last to complete, got {:?}",
+                completed
+            );
+        }
+        assert_eq!(
+            peak_in_flight.load(Ordering::SeqCst),
+            1,
+            "burst turns must be serialized, never overlap"
+        );
+        assert_eq!(
+            in_flight.load(Ordering::SeqCst),
+            0,
+            "no provider call may linger"
+        );
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert!(
+            sent_messages.iter().any(|m| m.contains("response-")),
+            "the newest turn's response must be delivered, got {:?}",
+            *sent_messages
+        );
+    }
+
+    #[tokio::test]
+    async fn message_dispatch_debounced_top_level_latest_wins_over_gated_older_turn() {
+        // Debounce + cross-history interrupt integration: a top-level Slack
+        // turn that first passes through the debounce window must participate
+        // in `interrupt_on_new_message` exactly like a non-debounced one. The
+        // later inbound turn (B, itself debounced) receives the higher task_id
+        // at receiver admission and must cancel and supersede the earlier turn
+        // (A) that already started after its own debounce window -- even though
+        // A is held inside the agent loop. (task_id is captured at admission,
+        // before any debounce timer runs, so the debounce branch can never
+        // reorder the older/newer relation.)
+        let channel_impl = Arc::new(SlackRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        let first_gated_call_started = Arc::new(tokio::sync::Notify::new());
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak_in_flight = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(GatedCallSequenceProvider {
+            classifier_gate: false,
+            // A is pinned on the first history call inside the agent loop,
+            // which observes cancellation: B cancels A and A aborts without a
+            // release (same mechanism as the non-debounced interrupt tests).
+            gate_first_history_call: true,
+            release: release.clone(),
+            first_gated_call_started: first_gated_call_started.clone(),
+            calls: std::sync::Mutex::new(Vec::new()),
+            completed: std::sync::Mutex::new(Vec::new()),
+            classifier_calls: AtomicUsize::new(0),
+            history_calls: AtomicUsize::new(0),
+            in_flight: in_flight.clone(),
+            peak_in_flight: peak_in_flight.clone(),
+        });
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.debounce_ms = 50;
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider.clone(),
+            config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let mut ctx = (*runtime_ctx).clone();
+        ctx.interrupt_on_new_message.slack = true;
+        let runtime_ctx = Arc::new(ctx);
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let loop_task = ::zeroclaw_spawn::spawn!(run_message_dispatch_loop(
+            rx,
+            AgentRouter::single(runtime_ctx),
+            2
+        ));
+        let top_level = |id: &str, content: &str| zeroclaw_api::channel::ChannelMessage {
+            id: id.into(),
+            sender: "alice".into(),
+            reply_target: "C123".into(),
+            content: content.into(),
+            channel: "slack".into(),
+            channel_alias: None,
+            timestamp: 1,
+            thread_ts: Some(id.into()),
+            interruption_scope_id: None,
+            attachments: vec![],
+            subject: None,
+            ..Default::default()
+        };
+        // First top-level message: after its 50ms debounce window it starts
+        // and is pinned on the gated first history call.
+        tx.send(top_level("1741234567.100001", "first question"))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), first_gated_call_started.notified())
+            .await
+            .expect("first (debounced) turn must reach the agent-loop gate");
+        // Second top-level message: also debounced; once its window expires the
+        // worker must cancel the older gated turn and wait for it (no release
+        // needed -- the gated turn is aborted by cancellation), then complete.
+        tx.send(top_level("1741234567.200002", "second question"))
+            .await
+            .unwrap();
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(2), loop_task)
+            .await
+            .expect("dispatch loop must finish without releasing the gated first turn (it must be interrupted by the debounced second turn)")
+            .unwrap();
+
+        {
+            let completed = provider.completed.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                completed.len(),
+                1,
+                "only the second (debounced) turn may complete, got {completed:?}"
+            );
+            assert!(
+                completed[0]
+                    .iter()
+                    .any(|(role, content)| role == "user" && content.contains("second question")),
+                "the later debounced turn must run to completion, got {:?}",
+                completed[0]
+            );
+        }
+        assert_eq!(
+            peak_in_flight.load(Ordering::SeqCst),
+            1,
+            "debounced interrupt turns must be serialized, never overlap"
+        );
+        assert_eq!(
+            in_flight.load(Ordering::SeqCst),
+            0,
+            "no provider call may linger"
+        );
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert!(
+            !sent_messages.iter().any(|m| m.contains("response-1")),
+            "cancelled first turn must not deliver a response, got {:?}",
+            *sent_messages
+        );
+        assert!(
+            sent_messages.iter().any(|m| m.contains("response-2")),
+            "second turn's response must be delivered, got {:?}",
             *sent_messages
         );
     }
