@@ -24819,6 +24819,522 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
+    /// Provider that blocks selected calls behind a `release` `Notify` so tests
+    /// can pin a turn mid-flight and observe what the dispatch machinery does in
+    /// the meantime. `classifier_gate` gates the first `chat_with_system` call
+    /// (the reply-intent precheck runs before the main agent loop and ignores
+    /// cancellation); `gate_first_history_call` gates the first `chat_with_history`
+    /// call (inside the agent loop, which observes cancellation). `calls` records
+    /// every started history call, `completed` only those that passed the gate —
+    /// so tests can distinguish "started but cancelled" from "finished".
+    struct GatedCallSequenceProvider {
+        classifier_gate: bool,
+        gate_first_history_call: bool,
+        release: Arc<tokio::sync::Notify>,
+        first_gated_call_started: Arc<tokio::sync::Notify>,
+        calls: std::sync::Mutex<Vec<Vec<(String, String)>>>,
+        completed: std::sync::Mutex<Vec<Vec<(String, String)>>>,
+        classifier_calls: AtomicUsize,
+        history_calls: AtomicUsize,
+        in_flight: Arc<AtomicUsize>,
+        peak_in_flight: Arc<AtomicUsize>,
+    }
+
+    impl GatedCallSequenceProvider {
+        async fn wait_for_release(&self) {
+            // Register the waiter before awaiting so a release racing the gate
+            // registration is not lost.
+            let notified = self.release.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            notified.await;
+        }
+    }
+
+    /// Releases the in-flight counter when the call ends, including when it is
+    /// cancelled mid-gate: the agent loop aborts the provider future, so a
+    /// plain decrement after the gate would leak the count.
+    struct InFlightCounter(Arc<AtomicUsize>);
+
+    impl Drop for InFlightCounter {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for GatedCallSequenceProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            if self.classifier_gate && self.classifier_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.first_gated_call_started.notify_waiters();
+                self.wait_for_release().await;
+            }
+            Ok("REPLY".to_string())
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            let snapshot = messages
+                .iter()
+                .map(|m| (m.role.clone(), m.content.clone()))
+                .collect::<Vec<_>>();
+            // Gate the first history call only; the lane serializes one turn at
+            // a time, so the first call belongs to the first admitted turn.
+            let gated = self.gate_first_history_call
+                && self.history_calls.fetch_add(1, Ordering::SeqCst) == 0;
+            let call_index = {
+                let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
+                calls.push(snapshot.clone());
+                calls.len()
+            };
+            // Count the call from entry so a gated turn sits inside the
+            // in-flight window; the Drop guard releases the count even when
+            // the call is cancelled mid-gate.
+            let _in_flight = InFlightCounter(self.in_flight.clone());
+            let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            let mut peak = self.peak_in_flight.load(Ordering::SeqCst);
+            while current > peak {
+                match self.peak_in_flight.compare_exchange(
+                    peak,
+                    current,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => peak = actual,
+                }
+            }
+            if gated {
+                self.first_gated_call_started.notify_waiters();
+                self.wait_for_release().await;
+            }
+            {
+                let mut completed = self.completed.lock().unwrap_or_else(|e| e.into_inner());
+                completed.push(snapshot);
+            }
+            Ok(format!("response-{call_index}"))
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for GatedCallSequenceProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "GatedCallSequenceProvider"
+        }
+    }
+
+    /// The Slack root of a thread carries its own timestamp as the history
+    /// anchor but no interruption-scope id, while a reply in that thread carries
+    /// the root timestamp as its scope id. Different interruption scopes, one
+    /// shared conversation history: the lane must still serialize them, so the
+    /// reply cannot run against a history snapshot taken before the root turn
+    /// wrote its answer.
+    #[tokio::test]
+    async fn message_dispatch_serializes_slack_root_and_thread_followup() {
+        let channel_impl = Arc::new(SlackRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        let first_gated_call_started = Arc::new(tokio::sync::Notify::new());
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak_in_flight = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(GatedCallSequenceProvider {
+            classifier_gate: false,
+            gate_first_history_call: true,
+            release: release.clone(),
+            first_gated_call_started: first_gated_call_started.clone(),
+            calls: std::sync::Mutex::new(Vec::new()),
+            completed: std::sync::Mutex::new(Vec::new()),
+            classifier_calls: AtomicUsize::new(0),
+            history_calls: AtomicUsize::new(0),
+            in_flight: in_flight.clone(),
+            peak_in_flight: peak_in_flight.clone(),
+        });
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider.clone(),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let loop_task = zeroclaw_spawn::spawn!(run_message_dispatch_loop(
+            rx,
+            AgentRouter::single(runtime_ctx),
+            2
+        ));
+        // Root message of the thread: its own ts is the history anchor.
+        tx.send(zeroclaw_api::channel::ChannelMessage {
+            id: "1741234567.100001".into(),
+            sender: "alice".into(),
+            reply_target: "C123".into(),
+            content: "root question".into(),
+            channel: "slack".into(),
+            channel_alias: None,
+            timestamp: 1,
+            thread_ts: Some("1741234567.100001".into()),
+            interruption_scope_id: None,
+            attachments: vec![],
+            subject: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), first_gated_call_started.notified())
+            .await
+            .expect("root turn must gate in the provider");
+        // Follow-up in the same thread: same history, distinct scope id.
+        tx.send(zeroclaw_api::channel::ChannelMessage {
+            id: "1741234567.200002".into(),
+            sender: "alice".into(),
+            reply_target: "C123".into(),
+            content: "follow-up in thread".into(),
+            channel: "slack".into(),
+            channel_alias: None,
+            timestamp: 2,
+            thread_ts: Some("1741234567.100001".into()),
+            interruption_scope_id: Some("1741234567.100001".into()),
+            attachments: vec![],
+            subject: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        // The follow-up must NOT enter the provider while the root is gated.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        {
+            let calls = provider.calls.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                calls.len(),
+                1,
+                "follow-up must wait for the root turn instead of running concurrently, got {} provider calls",
+                calls.len()
+            );
+        }
+        assert_eq!(
+            peak_in_flight.load(Ordering::SeqCst),
+            1,
+            "root and thread follow-up share one history session and must serialize"
+        );
+        release.notify_waiters();
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(2), loop_task)
+            .await
+            .expect("dispatch loop must finish after both turns")
+            .unwrap();
+
+        {
+            let calls = provider.calls.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(calls.len(), 2, "both turns must run, in order");
+            let second = &calls[1];
+            assert!(
+                second.iter().any(
+                    |(role, content)| role == "user" && content.contains("follow-up in thread")
+                ),
+                "follow-up call must carry its own message, got {:?}",
+                *second
+            );
+            assert!(
+                second.iter().any(|(role, content)| {
+                    role == "assistant" && content.contains("response-1")
+                }),
+                "follow-up call must include the root turn's saved result, got {:?}",
+                *second
+            );
+        }
+        assert_eq!(
+            in_flight.load(Ordering::SeqCst),
+            0,
+            "no provider call may linger"
+        );
+    }
+
+    /// A root and its thread follow-up share one lane, but `/stop` written
+    /// inside the thread must cancel only the follow-up's queued turn: the
+    /// interruption scope is the thread, not the history lane.
+    #[tokio::test]
+    async fn message_dispatch_thread_stop_cancels_followup_not_root_of_same_history() {
+        let channel_impl = Arc::new(SlackRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let release = Arc::new(tokio::sync::Notify::new());
+        let first_gated_call_started = Arc::new(tokio::sync::Notify::new());
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak_in_flight = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(GatedCallSequenceProvider {
+            classifier_gate: false,
+            gate_first_history_call: true,
+            release: release.clone(),
+            first_gated_call_started: first_gated_call_started.clone(),
+            calls: std::sync::Mutex::new(Vec::new()),
+            completed: std::sync::Mutex::new(Vec::new()),
+            classifier_calls: AtomicUsize::new(0),
+            history_calls: AtomicUsize::new(0),
+            in_flight: in_flight.clone(),
+            peak_in_flight: peak_in_flight.clone(),
+        });
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider.clone(),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let loop_task = zeroclaw_spawn::spawn!(run_message_dispatch_loop(
+            rx,
+            AgentRouter::single(runtime_ctx),
+            2
+        ));
+        tx.send(zeroclaw_api::channel::ChannelMessage {
+            id: "1741234567.100001".into(),
+            sender: "alice".into(),
+            reply_target: "C123".into(),
+            content: "root question".into(),
+            channel: "slack".into(),
+            channel_alias: None,
+            timestamp: 1,
+            thread_ts: Some("1741234567.100001".into()),
+            interruption_scope_id: None,
+            attachments: vec![],
+            subject: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), first_gated_call_started.notified())
+            .await
+            .expect("root turn must gate in the provider");
+        // Follow-up in the same thread queues behind the root.
+        tx.send(zeroclaw_api::channel::ChannelMessage {
+            id: "1741234567.200002".into(),
+            sender: "alice".into(),
+            reply_target: "C123".into(),
+            content: "follow-up in thread".into(),
+            channel: "slack".into(),
+            channel_alias: None,
+            timestamp: 2,
+            thread_ts: Some("1741234567.100001".into()),
+            interruption_scope_id: Some("1741234567.100001".into()),
+            attachments: vec![],
+            subject: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        // /stop written inside the thread: targets the follow-up's scope only.
+        tx.send(zeroclaw_api::channel::ChannelMessage {
+            id: "1741234567.300003".into(),
+            sender: "alice".into(),
+            reply_target: "C123".into(),
+            content: "/stop".into(),
+            channel: "slack".into(),
+            channel_alias: None,
+            timestamp: 3,
+            thread_ts: Some("1741234567.100001".into()),
+            interruption_scope_id: Some("1741234567.100001".into()),
+            attachments: vec![],
+            subject: None,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        // While the root is still gated, its turn must keep running untouched.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(
+            in_flight.load(Ordering::SeqCst),
+            1,
+            "root turn must still be in flight after a thread-scoped /stop"
+        );
+        {
+            let calls = provider.calls.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(calls.len(), 1, "follow-up must be cancelled, never started");
+        }
+        release.notify_waiters();
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(2), loop_task)
+            .await
+            .expect("dispatch loop must finish after the root turn")
+            .unwrap();
+
+        let stop_ack = zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-sent");
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert!(
+            sent_messages.iter().any(|m| m.contains("response-1")),
+            "root turn's response must be delivered, got {:?}",
+            *sent_messages
+        );
+        assert!(
+            sent_messages.iter().any(|m| m.contains(&stop_ack)),
+            "thread /stop must be acknowledged, got {:?}",
+            *sent_messages
+        );
+        assert!(
+            !sent_messages.iter().any(|m| m.contains("response-2")),
+            "cancelled follow-up must never run, got {:?}",
+            *sent_messages
+        );
+        {
+            let completed = provider.completed.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(completed.len(), 1, "only the root turn may complete");
+        }
+    }
+
+    /// Slack keys a top-level message's history by its own timestamp, so a
+    /// `/stop` sent as a fresh top-level message shares the sender's
+    /// interruption scope but not the pending turn's lane key. A thread reply to
+    /// that pending turn keys history by the root timestamp and therefore reuses
+    /// its debounce bucket. Cancelling the task alone would leave the stopped
+    /// text buffered, and the reply would fold into it — the stopped turn would
+    /// ride along as `stopped\nreply`. Retiring the stopped payload is what
+    /// prevents that.
+    #[tokio::test]
+    async fn message_dispatch_slack_top_level_stop_retires_pending_payload_of_thread_bucket() {
+        let channel_impl = Arc::new(SlackRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak_in_flight = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(GatedCallSequenceProvider {
+            classifier_gate: false,
+            gate_first_history_call: false,
+            release: Arc::new(tokio::sync::Notify::new()),
+            first_gated_call_started: Arc::new(tokio::sync::Notify::new()),
+            calls: std::sync::Mutex::new(Vec::new()),
+            completed: std::sync::Mutex::new(Vec::new()),
+            classifier_calls: AtomicUsize::new(0),
+            history_calls: AtomicUsize::new(0),
+            in_flight: in_flight.clone(),
+            peak_in_flight: peak_in_flight.clone(),
+        });
+
+        let config = zeroclaw_config::schema::Config {
+            channels: zeroclaw_config::schema::ChannelsConfig {
+                debounce_ms: 600,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider.clone(),
+            config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let loop_task = zeroclaw_spawn::spawn!(run_message_dispatch_loop(
+            rx,
+            AgentRouter::single(runtime_ctx),
+            2
+        ));
+        // Top-level: no `thread_ts` from Slack, so the channel implementation
+        // anchors the thread on the message's own timestamp and leaves the
+        // interruption scope sender-wide.
+        let top_level = |id: &str, content: &str| zeroclaw_api::channel::ChannelMessage {
+            id: id.into(),
+            sender: "alice".into(),
+            reply_target: "C123".into(),
+            content: content.into(),
+            channel: "slack".into(),
+            timestamp: 1,
+            thread_ts: Some(id.into()),
+            interruption_scope_id: None,
+            ..Default::default()
+        };
+
+        tx.send(top_level("1741234567.100001", "stopped instruction"))
+            .await
+            .unwrap();
+        tx.send(top_level("1741234567.300003", "/stop"))
+            .await
+            .unwrap();
+        // The acknowledgement is produced after the payload is retired (both
+        // happen in the receiver), so waiting for it pins the retirement before
+        // the reply below reuses the stopped turn's bucket.
+        let stop_ack = zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-sent");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let sent = channel_impl.sent_messages.lock().await;
+                if sent.iter().any(|m| m.contains(&stop_ack)) {
+                    return;
+                }
+                drop(sent);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a pending debounce payload must be visible to /stop");
+        tx.send(zeroclaw_api::channel::ChannelMessage {
+            id: "1741234567.400004".into(),
+            sender: "alice".into(),
+            reply_target: "C123".into(),
+            content: "second question".into(),
+            channel: "slack".into(),
+            timestamp: 2,
+            thread_ts: Some("1741234567.100001".into()),
+            interruption_scope_id: Some("1741234567.100001".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(5), loop_task)
+            .await
+            .expect("dispatch loop must finish after the retired payload was reused")
+            .unwrap();
+
+        let completed = provider.completed.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            completed.len(),
+            1,
+            "only the thread reply may run, got {completed:?}"
+        );
+        assert!(
+            completed[0]
+                .iter()
+                .any(|(role, content)| role == "user" && content.contains("second question")),
+            "the reply must run on its own text, got {:?}",
+            completed[0]
+        );
+        assert!(
+            !completed[0]
+                .iter()
+                .any(|(role, content)| role == "user" && content.contains("stopped instruction")),
+            "the reply must not inherit the stopped turn's bucket, got {:?}",
+            completed[0]
+        );
+        assert_eq!(
+            in_flight.load(Ordering::SeqCst),
+            0,
+            "no provider call may linger"
+        );
+    }
+
     #[tokio::test]
     async fn message_dispatch_processes_messages_in_parallel() {
         let channel_impl = Arc::new(RecordingChannel::default());
