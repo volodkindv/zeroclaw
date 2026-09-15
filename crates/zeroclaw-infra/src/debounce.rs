@@ -132,8 +132,8 @@ impl MessageDebouncer {
     /// Cancelling tracked work is not enough on its own: text that has already
     /// been folded into a bucket is not a task, and a later message for the
     /// same key would inherit it (the bucket is shared by key, its sender is
-    /// replaced, and its messages are concatenated by
-    /// [`fire_debounced`]). Retiring the bucket is what retracts stopped
+    /// replaced, and its messages are concatenated when the timer fires).
+    /// Retiring the bucket is what retracts stopped
     /// instructions before any later message can reuse them.
     ///
     /// Returns `true` when a buffered payload was retired.
