@@ -1590,12 +1590,22 @@ fn interruption_scope_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String
                 msg.sender
             ))
         }
+        // The Sender arms stay in their raw four/three-component form: an
+        // interruption scope id may legitimately carry characters such as the
+        // `$thread1` form pinned by the tests below, and every consumer of this
+        // key compares only keys produced here. They are alias-aware, though:
+        // two listeners of the same channel type on one reply target must not
+        // share an interruption slot, or one listener's `/stop` cancels the
+        // other's turn.
         (zeroclaw_api::channel::ChannelConversationScope::Sender, Some(scope)) => format!(
             "{}_{}_{}_{}",
-            msg.channel, msg.reply_target, msg.sender, scope
+            channel_scope(msg),
+            msg.reply_target,
+            msg.sender,
+            scope
         ),
         (zeroclaw_api::channel::ChannelConversationScope::Sender, None) => {
-            format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender)
+            format!("{}_{}_{}", channel_scope(msg), msg.reply_target, msg.sender)
         }
     }
 }
@@ -39062,6 +39072,67 @@ This is an example JSON object for profile settings."#;
             ..Default::default()
         };
         assert_eq!(interruption_scope_key(&msg), "slack_C123_alice");
+    }
+
+    /// Two listeners of the same channel type sharing one reply target must not
+    /// share an interruption slot: without the alias in the key, `/stop` on one
+    /// listener would cancel the other listener's in-flight turn.
+    #[test]
+    fn interruption_scope_key_sender_scope_is_alias_aware() {
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "1".into(),
+            sender: "alice".into(),
+            reply_target: "room".into(),
+            content: "hi".into(),
+            channel: "slack".into(),
+            channel_alias: Some("work".into()),
+            timestamp: 0,
+            thread_ts: None,
+            interruption_scope_id: None,
+            conversation_scope: zeroclaw_api::channel::ChannelConversationScope::Sender,
+            attachments: vec![],
+            subject: None,
+
+            ..Default::default()
+        };
+        assert_eq!(interruption_scope_key(&msg), "slack.work_room_alice");
+
+        let mut other_listener = msg.clone();
+        other_listener.channel_alias = Some("personal".into());
+        assert_ne!(
+            interruption_scope_key(&msg),
+            interruption_scope_key(&other_listener)
+        );
+
+        // Without an alias the key keeps its historical raw form.
+        let mut unaliased = msg.clone();
+        unaliased.channel_alias = None;
+        assert_eq!(interruption_scope_key(&unaliased), "slack_room_alice");
+    }
+
+    #[test]
+    fn interruption_scope_key_sender_scope_with_scope_id_is_alias_aware() {
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "1".into(),
+            sender: "alice".into(),
+            reply_target: "C123".into(),
+            content: "hi".into(),
+            channel: "slack".into(),
+            channel_alias: Some("work".into()),
+            timestamp: 0,
+            thread_ts: Some("$thread1".into()),
+            interruption_scope_id: Some("$thread1".into()),
+            conversation_scope: zeroclaw_api::channel::ChannelConversationScope::Sender,
+            attachments: vec![],
+            subject: None,
+
+            ..Default::default()
+        };
+        // The scope id keeps its raw form; only the channel scope gains the alias.
+        assert_eq!(
+            interruption_scope_key(&msg),
+            "slack.work_C123_alice_$thread1"
+        );
     }
 
     #[tokio::test]
