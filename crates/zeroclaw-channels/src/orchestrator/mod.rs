@@ -1643,6 +1643,14 @@ fn followup_thread_id(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<Str
 /// key retains `msg.sender` even when conversation history is shared
 /// (`ReplyTarget` scope). Without the sender, one member's message or `/stop`
 /// in a shared session would cancel another member's active request.
+/// Doubles every `_` in one component of an interruption key. Joining escaped
+/// components with a single `_` keeps the join injective, so an alias or a
+/// reply target that contains an underscore cannot collide with another
+/// listener's key.
+fn escape_scope_component(part: &str) -> String {
+    part.replace('_', "__")
+}
+
 fn interruption_scope_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
     match (msg.conversation_scope, msg.interruption_scope_id.as_deref()) {
         (zeroclaw_api::channel::ChannelConversationScope::ReplyTarget, Some(scope)) => {
@@ -1662,17 +1670,22 @@ fn interruption_scope_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String
         // key compares only keys produced here. They are alias-aware, though:
         // two listeners of the same channel type on one reply target must not
         // share an interruption slot, or one listener's `/stop` cancels the
-        // other's turn.
+        // other's turn. Every component is escaped before the `_` join, so an
+        // underscore inside an alias or a reply target cannot forge the
+        // separator and collapse two listeners back onto one key.
         (zeroclaw_api::channel::ChannelConversationScope::Sender, Some(scope)) => format!(
             "{}_{}_{}_{}",
-            channel_scope(msg),
-            msg.reply_target,
-            msg.sender,
-            scope
+            escape_scope_component(&channel_scope(msg)),
+            escape_scope_component(&msg.reply_target),
+            escape_scope_component(&msg.sender),
+            escape_scope_component(scope)
         ),
-        (zeroclaw_api::channel::ChannelConversationScope::Sender, None) => {
-            format!("{}_{}_{}", channel_scope(msg), msg.reply_target, msg.sender)
-        }
+        (zeroclaw_api::channel::ChannelConversationScope::Sender, None) => format!(
+            "{}_{}_{}",
+            escape_scope_component(&channel_scope(msg)),
+            escape_scope_component(&msg.reply_target),
+            escape_scope_component(&msg.sender)
+        ),
     }
 }
 
@@ -41496,6 +41509,35 @@ This is an example JSON object for profile settings."#;
             ..Default::default()
         };
         assert_eq!(interruption_scope_key(&msg), "matrix_room_alice_$thread1");
+    }
+
+    #[test]
+    fn interruption_scope_key_keeps_listeners_apart_when_underscores_collide() {
+        // Without escaping, `slack.work` + `room_x` and `slack.work_room` + `x`
+        // both render as `slack.work_room_x_alice`, which would let one
+        // listener's `/stop` cancel the other listener's turn.
+        let scoped = |alias: &str, reply_target: &str| zeroclaw_api::channel::ChannelMessage {
+            id: "1".into(),
+            sender: "alice".into(),
+            reply_target: reply_target.into(),
+            content: "hi".into(),
+            channel: "slack".into(),
+            channel_alias: Some(alias.into()),
+            timestamp: 0,
+            thread_ts: None,
+            interruption_scope_id: Some("1234567890.000100".into()),
+            attachments: vec![],
+            subject: None,
+
+            ..Default::default()
+        };
+
+        let short_alias = interruption_scope_key(&scoped("work", "room_x"));
+        let long_alias = interruption_scope_key(&scoped("work_room", "x"));
+
+        assert_eq!(short_alias, "slack.work_room__x_alice_1234567890.000100");
+        assert_eq!(long_alias, "slack.work__room_x_alice_1234567890.000100");
+        assert_ne!(short_alias, long_alias);
     }
 
     #[test]
