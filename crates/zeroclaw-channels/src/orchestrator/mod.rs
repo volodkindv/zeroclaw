@@ -10108,14 +10108,19 @@ async fn run_message_dispatch_loop(
             // `/stop` is also a debounce boundary. Retiring the open bucket
             // wakes its reserved inbound slot, whose RAII registration then
             // disappears; a message inside the old window starts fresh. The
-            // stop message's own bucket goes first — it is a boundary whether or
-            // not a turn owns it — and the buckets of the cancelled turns follow,
-            // each one only if that turn still owns it.
+            // stop message's own key is a boundary only where no live turn owns
+            // it: a `/stop` sent inside a Slack thread keys the same history as
+            // the root message it replies to, while that root turn lives in
+            // another interruption scope — retiring the bucket blindly would
+            // erase a payload this stop never cancelled. The buckets of the
+            // cancelled turns follow, each one only if that turn still owns it.
             let own_debounce_key =
                 message_debounce_key(runtime_conversation_history_key(ctx.as_ref(), &msg), &msg);
-            let mut cancelled_bucket = ctx.debouncer.cancel(&own_debounce_key).await;
-            debounce_buckets.remove(&own_debounce_key);
-            debounce_bucket_owners.remove(&own_debounce_key);
+            let mut cancelled_bucket = false;
+            if !debounce_bucket_owners.contains_key(&own_debounce_key) {
+                cancelled_bucket = ctx.debouncer.cancel(&own_debounce_key).await;
+                debounce_buckets.remove(&own_debounce_key);
+            }
 
             for (debounce_key, owner) in &debounce_keys {
                 cancelled_bucket |= retire_owned_bucket(
@@ -10329,6 +10334,26 @@ async fn run_message_dispatch_loop(
         // so the loop remains free to receive `/stop` and interruptions.
         let registration =
             register_inbound_turn(&ctx, &msg, &in_flight_by_sender, &task_sequence).await;
+        // Registering with interruption enabled cancels the turn this one
+        // supersedes. A message that bypasses debounce (a runtime command such
+        // as `/new`, or a channel with no window) can supersede a turn that is
+        // still waiting inside its own debounce window, where the payload
+        // occupies a bucket whose reserved slot will never run: the next
+        // message would extend that bucket and be dropped with it. Retire it,
+        // only where that turn still owns the bucket.
+        if let Some(superseded) = registration
+            .as_ref()
+            .and_then(|registration| registration.superseded.as_ref())
+        {
+            retire_owned_bucket(
+                ctx.as_ref(),
+                &mut debounce_buckets,
+                &mut debounce_bucket_owners,
+                &superseded.debounce_key,
+                superseded.task_id,
+            )
+            .await;
+        }
         let source_key = conversation_history_key(&msg);
         spawn_inbound_routing(
             Arc::clone(&lanes),
@@ -25912,6 +25937,255 @@ BTC is currently around $65,000 based on latest tool output."#
             in_flight.load(Ordering::SeqCst),
             0,
             "no provider call may linger"
+        );
+    }
+
+    /// A `/stop` sent inside a Slack thread keys the root message's history
+    /// lane, but it stops the thread scope while the root turn lives in the
+    /// sender-wide one. Retiring the stop message's own key without consulting
+    /// the recorded owner erases the root's still-debouncing payload — a
+    /// message this stop never cancelled.
+    #[tokio::test]
+    async fn message_dispatch_slack_thread_stop_preserves_a_debouncing_root_bucket() {
+        let channel_impl = Arc::new(SlackRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak_in_flight = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(GatedCallSequenceProvider {
+            classifier_gate: false,
+            gate_first_history_call: false,
+            release: Arc::new(tokio::sync::Notify::new()),
+            first_gated_call_started: Arc::new(tokio::sync::Notify::new()),
+            calls: std::sync::Mutex::new(Vec::new()),
+            completed: std::sync::Mutex::new(Vec::new()),
+            classifier_calls: AtomicUsize::new(0),
+            history_calls: AtomicUsize::new(0),
+            in_flight: in_flight.clone(),
+            peak_in_flight: peak_in_flight.clone(),
+        });
+
+        let config = zeroclaw_config::schema::Config {
+            channels: zeroclaw_config::schema::ChannelsConfig {
+                debounce_ms: 600,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider.clone(),
+            config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let loop_task = zeroclaw_spawn::spawn!(run_message_dispatch_loop(
+            rx,
+            AgentRouter::single(runtime_ctx),
+            2
+        ));
+        let slack_message = |id: &str, thread: &str, content: &str, scope: Option<&str>| {
+            zeroclaw_api::channel::ChannelMessage {
+                id: id.into(),
+                sender: "alice".into(),
+                reply_target: "C123".into(),
+                content: content.into(),
+                channel: "slack".into(),
+                timestamp: 1,
+                thread_ts: Some(thread.into()),
+                interruption_scope_id: scope.map(str::to_string),
+                ..Default::default()
+            }
+        };
+
+        // The root never leaves its window: the stop lands inside it, keyed to
+        // the same lane but scoped to the thread.
+        tx.send(slack_message(
+            "1741234567.100001",
+            "1741234567.100001",
+            "root question",
+            None,
+        ))
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        tx.send(slack_message(
+            "1741234567.200002",
+            "1741234567.100001",
+            "/stop",
+            Some("1741234567.100001"),
+        ))
+        .await
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                {
+                    let completed = provider.completed.lock().unwrap_or_else(|e| e.into_inner());
+                    if completed.iter().any(|batch| {
+                        batch.iter().any(|(role, content)| {
+                            role == "user" && content.contains("root question")
+                        })
+                    }) {
+                        return;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a thread /stop must not retire the root turn's debounce bucket");
+
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(5), loop_task)
+            .await
+            .expect("dispatch loop must finish after the root payload ran")
+            .unwrap();
+
+        let completed = provider.completed.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            completed.len(),
+            1,
+            "the debouncing root turn must run exactly once, got {completed:?}"
+        );
+        assert_eq!(
+            in_flight.load(Ordering::SeqCst),
+            0,
+            "no provider call may linger"
+        );
+    }
+
+    /// A message that bypasses debounce (a runtime command such as `/new`, or a
+    /// channel whose window is zero) still supersedes the turn before it when
+    /// interruption is enabled. Superseding alone leaves that turn's bucket
+    /// open with a reserved slot that will never run, so the next message
+    /// extends the cancelled bucket and is dropped with it.
+    #[tokio::test]
+    async fn message_dispatch_runtime_command_retires_the_bucket_it_superseded() {
+        let channel_impl = Arc::new(SlackRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak_in_flight = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(GatedCallSequenceProvider {
+            classifier_gate: false,
+            gate_first_history_call: false,
+            release: Arc::new(tokio::sync::Notify::new()),
+            first_gated_call_started: Arc::new(tokio::sync::Notify::new()),
+            calls: std::sync::Mutex::new(Vec::new()),
+            completed: std::sync::Mutex::new(Vec::new()),
+            classifier_calls: AtomicUsize::new(0),
+            history_calls: AtomicUsize::new(0),
+            in_flight: in_flight.clone(),
+            peak_in_flight: peak_in_flight.clone(),
+        });
+
+        let mut channels = zeroclaw_config::schema::ChannelsConfig {
+            debounce_ms: 600,
+            ..Default::default()
+        };
+        channels.slack.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::SlackConfig {
+                interrupt_on_new_message: true,
+                ..Default::default()
+            },
+        );
+        let config = zeroclaw_config::schema::Config {
+            channels,
+            ..Default::default()
+        };
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider.clone(),
+            config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let loop_task = zeroclaw_spawn::spawn!(run_message_dispatch_loop(
+            rx,
+            AgentRouter::single(runtime_ctx),
+            2
+        ));
+        // One thread lane: every message below keys the same debounce bucket.
+        let thread_message = |id: &str, content: &str| zeroclaw_api::channel::ChannelMessage {
+            id: id.into(),
+            sender: "alice".into(),
+            reply_target: "C123".into(),
+            content: content.into(),
+            channel: "slack".into(),
+            timestamp: 1,
+            thread_ts: Some("1741234567.100001".into()),
+            interruption_scope_id: Some("1741234567.100001".into()),
+            ..Default::default()
+        };
+
+        // The first turn is still inside its window when the command supersedes
+        // it, and the third message lands before that window would have closed.
+        tx.send(thread_message("1741234567.200002", "first question"))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        tx.send(thread_message("1741234567.300003", "/new"))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        tx.send(thread_message("1741234567.400004", "second question"))
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                {
+                    let completed = provider.completed.lock().unwrap_or_else(|e| e.into_inner());
+                    if completed.iter().any(|batch| {
+                        batch.iter().any(|(role, content)| {
+                            role == "user" && content.contains("second question")
+                        })
+                    }) {
+                        return;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect(
+            "the message after a bypassing command must not be dropped with the retired bucket",
+        );
+
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(5), loop_task)
+            .await
+            .expect("dispatch loop must finish after the fresh bucket ran")
+            .unwrap();
+
+        let completed = provider.completed.lock().unwrap_or_else(|e| e.into_inner());
+        let second_calls = completed
+            .iter()
+            .filter(|batch| {
+                batch
+                    .iter()
+                    .any(|(role, content)| role == "user" && content.contains("second question"))
+            })
+            .count();
+        assert_eq!(
+            second_calls, 1,
+            "the message after the command must run exactly once, got {completed:?}"
+        );
+        assert!(
+            !completed.iter().any(|batch| {
+                batch
+                    .iter()
+                    .any(|(role, content)| role == "user" && content.contains("first question"))
+            }),
+            "the superseded payload must never reach the provider: {completed:?}"
         );
         assert_eq!(
             in_flight.load(Ordering::SeqCst),
